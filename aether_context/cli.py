@@ -33,12 +33,14 @@ import argparse
 import importlib.util
 import json
 import os
+import shutil
 import sys
 import urllib.error
 import urllib.request
+from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType
-from typing import Sequence
+from typing import Any, Sequence
 
 from aether_context import __version__
 from aether_context.config import (
@@ -47,6 +49,7 @@ from aether_context.config import (
     reach_tokens,
 )
 from aether_context.errors import AetherContextError
+from aether_context.session import Session
 
 #: Environment variable read for the pool size when no ``--pool`` flag is given (non-tty).
 _ENV_POOL_GB = "AETHER_POOL_GB"
@@ -112,7 +115,63 @@ def build_parser() -> argparse.ArgumentParser:
     p_bench.add_argument("--quick", action="store_true", help="shorter build (CI smoke).")
     p_bench.add_argument("--json", action="store_true", help="machine-readable report.")
 
+    p_run = subparsers.add_parser(
+        "run", help="run one task through the engine and print the result + a status line."
+    )
+    p_run.add_argument("task", type=str, help="the task/prompt to run.")
+    _add_session_flags(p_run)
+
+    p_chat = subparsers.add_parser(
+        "chat", help="interactive REPL with slash-commands (/clear /new /status /quit ...)."
+    )
+    _add_session_flags(p_chat)
+
+    p_status = subparsers.add_parser(
+        "status", help="print pool GB / slices / reach / hit rate / pool-mode / index."
+    )
+    _add_session_flags(p_status)
+
+    p_clear = subparsers.add_parser(
+        "clear", help="empty the pool (this dir). --all removes the whole pool dir."
+    )
+    p_clear.add_argument("--dir", type=str, default=None, metavar="D", help="pool directory.")
+    p_clear.add_argument(
+        "--all", action="store_true",
+        help="remove the entire pool dir (always confirms; non-tty needs --yes).",
+    )
+    p_clear.add_argument(
+        "--yes", action="store_true",
+        help="proceed without an interactive prompt (required for non-tty destructive clears).",
+    )
+
     return parser
+
+
+#: Allowed values for the session-config flags (mirror PoolConfig's validators).
+_POOL_MODES = ("separate", "shared")
+_INDEX_KINDS = ("flat", "hnsw", "tiered")
+#: Default model for the run/chat surface — offline-safe so a clean clone just works.
+_DEFAULT_MODEL = "mock"
+
+
+def _add_session_flags(sub: argparse.ArgumentParser) -> None:
+    """Attach the shared session-config flags (--model/--pool/--pool-mode/--index/--dir)."""
+    sub.add_argument(
+        "--model", type=str, default=_DEFAULT_MODEL, metavar="M",
+        help="model spec (default: mock — runs fully offline).",
+    )
+    sub.add_argument(
+        "--pool", type=int, default=None, metavar="N", help="pool size in GB (>=5).",
+    )
+    sub.add_argument(
+        "--pool-mode", type=str, default="separate", choices=_POOL_MODES,
+        metavar="{separate,shared}", help="pool sharing mode (default: separate).",
+    )
+    sub.add_argument(
+        "--index", type=str, default="flat", choices=_INDEX_KINDS,
+        metavar="{flat,hnsw,tiered}", help="ANN index kind (default: flat).",
+    )
+    sub.add_argument("--dir", type=str, default=None, metavar="D", help="pool directory.")
 
 
 # ---------------------------------------------------------------------------
@@ -135,6 +194,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _cmd_doctor(args)
         if args.command == "bench":
             return _cmd_bench(args)
+        if args.command == "run":
+            return _cmd_run(args)
+        if args.command == "chat":
+            return _cmd_chat(args)
+        if args.command == "status":
+            return _cmd_status(args)
+        if args.command == "clear":
+            return _cmd_clear(args)
         # no subcommand: a top-level --pool is a resize; otherwise show help.
         if args.pool is not None:
             return _cmd_resize(args)
@@ -243,6 +310,404 @@ def _resolve_dir(flag: str | None) -> Path:
     if flag:
         return Path(flag)
     return PoolConfig().dir
+
+
+# ---------------------------------------------------------------------------
+# run — one task through the engine, then a one-line status.
+# ---------------------------------------------------------------------------
+def _build_session(args: argparse.Namespace) -> Session:
+    """Construct a :class:`Session` from the shared session-config flags (offline-safe).
+
+    ``--pool`` falls back to any persisted config's reach (so ``run`` after ``init`` honors
+    the chosen size) then the 5 GB floor. ``fallback_to_mock=True`` keeps a clean clone
+    working with no backend installed.
+    """
+    pool_dir = _resolve_dir(args.dir)
+    pool_gb = args.pool if args.pool is not None else PoolConfig.load(pool_dir).pool_gb
+    return Session(
+        model=args.model,
+        pool_gb=int(pool_gb),
+        pool_mode=args.pool_mode,
+        pool_index=args.index,
+        pool_dir=pool_dir,
+        fallback_to_mock=True,
+    )
+
+
+def _cmd_run(args: argparse.Namespace) -> int:
+    """Run ``args.task`` through a fresh session, print the text then a one-line status.
+
+    The session is closed in a ``finally`` so the pool is always flushed (the encoded slices
+    survive for a later ``status`` / ``chat`` over the same dir). Returns 0 on success.
+    """
+    session = _build_session(args)
+    try:
+        result = session.run(args.task)
+        print(result.text)
+        print(_status_line(session.status_dict()))
+        return 0
+    finally:
+        session.close()
+
+
+def _status_line(s: dict[str, Any]) -> str:
+    """A compact one-line status summary for the ``run`` tail."""
+    return (
+        f"[pool {s['pool_gb']} GB | slices {s['slices_used']}/{s['capacity']} | "
+        f"reach {int(s['reach_tokens']) / 1e9:.2f}B tok | hit {float(s['hit_rate']):.0%} | "
+        f"mode {s['pool_mode']} | index {s['index']}]"
+    )
+
+
+# ---------------------------------------------------------------------------
+# status — open the pool read-only and print the honest status fields.
+# ---------------------------------------------------------------------------
+def _cmd_status(args: argparse.Namespace) -> int:
+    """Print the status fields for the pool at ``--dir`` (no live session, so hit rate N/A).
+
+    Loads the persisted :class:`PoolConfig`, opens the pool read-only to count its slices,
+    and reports reach / capacity / resident-RAM estimate. The hit rate is honestly ``N/A``
+    here: there is no running pager to measure, so we do not fabricate one.
+    """
+    pool_dir = _resolve_dir(args.dir)
+    cfg = PoolConfig.load(pool_dir)
+    slices, capacity = _pool_counts(cfg)
+    reach = reach_tokens(cfg.pool_gb)
+    resident_mb = cfg.pool_gb * _INDEX_MB_PER_GB
+    print("aether-context status")
+    print(f"  pool:        {cfg.pool_gb} GB  (reach ~= {reach / 1e9:.2f}B tokens)")
+    print(f"  slices:      {slices} / {capacity}")
+    print(f"  reach:       {reach:,} tokens")
+    print("  hit rate:    N/A (no live session)")
+    print(f"  resident RAM ~= {resident_mb} MB (estimate)")
+    print(f"  pool-mode:   {cfg.mode}")
+    print(f"  index:       {cfg.index}")
+    return 0
+
+
+def _pool_counts(cfg: PoolConfig) -> tuple[int, int]:
+    """``(slices_used, capacity)`` for the pool at ``cfg.dir`` (0/0 if none on disk yet).
+
+    Opens the pool read-only via :class:`Session`'s storage layer; on a fresh/absent pool
+    the count is 0. Closed immediately so no mmap handle lingers (Windows-safe).
+    """
+    from aether_context.context_pool import ContextPool, slice_cost_bytes
+
+    pool = ContextPool(cfg)
+    try:
+        used = len(pool)
+        capacity = pool.ceiling_bytes // slice_cost_bytes(cfg.dim)
+        return used, int(capacity)
+    finally:
+        pool.close()
+
+
+# ---------------------------------------------------------------------------
+# clear — empty the pool (this dir) / remove the whole dir, with confirmation.
+# ---------------------------------------------------------------------------
+def _cmd_clear(args: argparse.Namespace) -> int:
+    """Clear the pool at ``--dir`` (all sessions) or remove the whole dir with ``--all``.
+
+    Confirmation policy (honest + safe): ``--all`` ALWAYS confirms; a non-default ``clear``
+    confirms when the pool is ``shared`` or a named/persistent dir. On a tty we ask; off a
+    tty we require ``--yes`` and refuse with a message otherwise (never block on input()).
+    """
+    pool_dir = _resolve_dir(args.dir)
+    if args.all:
+        return _clear_all(pool_dir, assume_yes=args.yes)
+    return _clear_slices(pool_dir, assume_yes=args.yes)
+
+
+def _clear_all(pool_dir: Path, *, assume_yes: bool) -> int:
+    """Remove the entire pool dir (always confirmed)."""
+    if not _confirm(f"remove the ENTIRE pool dir {pool_dir}?", assume_yes=assume_yes):
+        print("clear --all aborted (no confirmation).")
+        return 1
+    if pool_dir.exists():
+        shutil.rmtree(pool_dir, ignore_errors=True)
+    print(f"removed pool dir {pool_dir}")
+    return 0
+
+
+def _clear_slices(pool_dir: Path, *, assume_yes: bool) -> int:
+    """Empty the pool's slices (all sessions) at ``pool_dir``, confirming if persistent/shared."""
+    cfg = PoolConfig.load(pool_dir)
+    needs_confirm = cfg.mode == "shared" or _is_persistent_dir(pool_dir)
+    if needs_confirm and not _confirm(
+        f"clear all slices in the {cfg.mode} pool at {pool_dir}?", assume_yes=assume_yes
+    ):
+        print("clear aborted (no confirmation).")
+        return 1
+    removed = _clear_pool_slices(cfg)
+    print(f"cleared {removed} slice(s) from the pool at {pool_dir}")
+    return 0
+
+
+def _clear_pool_slices(cfg: PoolConfig) -> int:
+    """Drop every slice in the pool at ``cfg.dir`` (global clear) and flush. Returns the count.
+
+    ``ContextPool.close`` is idempotent, so the ``finally`` flush is safe even though the
+    happy path also closes (it must, so the emptied sidecar is on disk before we return and
+    a following ``status`` reads zero slices).
+    """
+    from aether_context.context_pool import ContextPool
+
+    pool = ContextPool(cfg)
+    try:
+        return pool.clear_session(None)  # None -> clear all sessions' slices
+    finally:
+        pool.close()  # flush the now-empty sidecar so a later status sees 0 (idempotent)
+
+
+def _is_persistent_dir(pool_dir: Path) -> bool:
+    """A dir is 'persistent' (worth confirming before clearing) iff it is not the default.
+
+    The default ``~/.aether-context`` is the throwaway/ephemeral home; an explicit ``--dir``
+    is treated as a named/persistent pool, so clearing it asks first on a tty.
+    """
+    try:
+        return pool_dir.resolve() != PoolConfig().dir.resolve()
+    except OSError:
+        return True
+
+
+def _confirm(question: str, *, assume_yes: bool) -> bool:
+    """Confirm a destructive action. ``--yes`` / a tty 'y' proceeds; non-tty without --yes refuses.
+
+    Never blocks under a non-tty (CI / pipes): if stdin is not interactive and ``--yes`` was
+    not passed we return False with an explanatory message rather than calling ``input()``.
+    """
+    if assume_yes:
+        return True
+    if sys.stdin is None or not sys.stdin.isatty():
+        print(f"refusing: {question} (non-interactive; pass --yes to proceed)", file=sys.stderr)
+        return False
+    try:
+        answer = input(f"{question} [y/N] ").strip().lower()
+    except EOFError:
+        return False
+    return answer in ("y", "yes")
+
+
+# ---------------------------------------------------------------------------
+# chat — interactive REPL with a pure, testable slash-command dispatcher.
+# ---------------------------------------------------------------------------
+@dataclass
+class ReplState:
+    """Mutable state the slash dispatcher reads/advises on (the REPL owns the side effects).
+
+    ``dispatch_slash`` is **pure**: it never touches the session or prints — it parses one
+    slash line against this state and returns an ``(action, message)`` pair. The REPL loop is
+    the only place that actually mutates the session, prints, or exits.
+    """
+
+    model: str = _DEFAULT_MODEL
+    pool_gb: int = POOL_GB_FLOOR
+    pool_mode: str = "separate"
+    index: str = "flat"
+    extended: bool = False
+
+
+#: The actions ``dispatch_slash`` can return (the REPL maps each to a real side effect).
+SLASH_ACTIONS: tuple[str, ...] = (
+    "continue", "quit", "clear", "new", "status", "pool", "model",
+    "think", "export", "help", "unknown",
+)
+
+#: The help text shown for ``/help`` (also printed at chat start).
+_CHAT_HELP = (
+    "slash-commands: /clear (alias /cls)  /new  /status  /pool <GB>  /model <name>  "
+    "/think  /export [file]  /help  /quit"
+)
+
+
+def dispatch_slash(state: ReplState, line: str) -> tuple[str, str]:
+    """Parse one slash ``line`` against ``state`` -> ``(action, message)``. PURE: no side effects.
+
+    Recognized: ``/clear`` (alias ``/cls``), ``/new``, ``/status``, ``/pool <GB>``,
+    ``/model <name>``, ``/think``, ``/export [file]``, ``/help``, ``/quit`` (aliases
+    ``/exit`` / ``/q``). Anything else yields ``("unknown", ...)``. ``message`` is the
+    argument payload for parameterized commands (e.g. the GB for ``/pool``, the path for
+    ``/export``) or a human-readable note; the REPL performs the actual effect.
+
+    Robust to a leading UTF-8 BOM that some shells prepend to piped/redirected input — both
+    the decoded form (``﻿``) and the raw 3-byte form (``\xef\xbb\xbf``) that appears when
+    Windows reads piped stdin under a non-UTF-8 console encoding — so a ``/command`` is still
+    recognized when the line is fed in non-interactively.
+    """
+    text = line.lstrip("﻿\xef\xbb\xbf").strip()
+    if not text.startswith("/"):
+        return ("continue", text)
+    parts = text[1:].split(maxsplit=1)
+    cmd = parts[0].lower() if parts else ""
+    arg = parts[1].strip() if len(parts) > 1 else ""
+
+    if cmd in ("quit", "exit", "q"):
+        return ("quit", "")
+    if cmd in ("clear", "cls"):
+        return ("clear", "")
+    if cmd == "new":
+        return ("new", "")
+    if cmd == "status":
+        return ("status", "")
+    if cmd == "help":
+        return ("help", _CHAT_HELP)
+    if cmd == "think":
+        return ("think", "")
+    if cmd == "export":
+        return ("export", arg)
+    if cmd == "pool":
+        return ("pool", arg)
+    if cmd == "model":
+        return ("model", arg)
+    return ("unknown", f"unknown command: /{cmd} ({_CHAT_HELP})")
+
+
+def _cmd_chat(args: argparse.Namespace) -> int:
+    """Interactive REPL. Non-tty: read a single line (or none) and exit cleanly.
+
+    Each input line is routed through :func:`dispatch_slash`; non-slash lines call
+    ``session.ask`` and print the reply. A best-effort ``readline`` binding inserts
+    ``/clear`` on Ctrl+L. In ``separate`` mode the ephemeral pool is dropped on exit.
+    """
+    session = _build_session(args)
+    state = ReplState(
+        model=args.model, pool_gb=session.pool_gb, pool_mode=args.pool_mode,
+        index=args.index, extended=session.extended,
+    )
+    _bind_readline_clear()
+    interactive = sys.stdin is not None and sys.stdin.isatty()
+    if interactive:
+        print(f"aether-context chat — {_CHAT_HELP}")
+    try:
+        return _chat_loop(args, session, state, interactive=interactive)
+    finally:
+        _drop_ephemeral(args, session)
+
+
+def _chat_loop(
+    args: argparse.Namespace, session: Session, state: ReplState, *, interactive: bool
+) -> int:
+    """The read/dispatch/print loop. Returns 0 on a clean exit."""
+    while True:
+        try:
+            line = input("> " if interactive else "")
+        except (EOFError, KeyboardInterrupt):
+            return 0
+        action, message = dispatch_slash(state, line)
+        if action == "quit":
+            return 0
+        cont = _apply_chat_action(args, session, state, action, message)
+        if not cont:
+            return 0
+        if not interactive:
+            # Non-tty chat handles exactly one line then exits cleanly (never blocks).
+            return 0
+
+
+def _apply_chat_action(
+    args: argparse.Namespace,
+    session: Session,
+    state: ReplState,
+    action: str,
+    message: str,
+) -> bool:
+    """Perform the side effect for one dispatched ``action``. Returns False to end the loop."""
+    if action == "continue":
+        if message:
+            print(session.ask(message))
+        return True
+    if action == "help":
+        print(message)
+        return True
+    if action == "status":
+        for ln in _status_lines(session.status_dict()):
+            print(ln)
+        return True
+    if action == "clear":
+        removed = session.clear(scope="session")
+        print(f"cleared {removed} slice(s); resident window reset.")
+        return True
+    if action == "new":
+        session.clear(scope="resident")
+        print("resident window cleared; reachable pool kept.")
+        return True
+    if action == "think":
+        on = session.toggle_extended()
+        state.extended = on
+        print(f"extended thinking: {'on' if on else 'off'}")
+        return True
+    if action == "export":
+        path = session.export(message or None)
+        print(f"transcript exported to {path}")
+        return True
+    if action == "pool":
+        print(_apply_pool_change(state, message))
+        return True
+    if action == "model":
+        if message:
+            state.model = message
+        print(f"model set to {state.model} (applies to the next `chat`/`run`).")
+        return True
+    # unknown
+    print(message)
+    return True
+
+
+def _apply_pool_change(state: ReplState, message: str) -> str:
+    """Validate + record a ``/pool <GB>`` change on the REPL state (advisory; not live-resized)."""
+    if not message.isdigit():
+        return f"usage: /pool <GB>  (got {message!r})"
+    gb = int(message)
+    if gb < POOL_GB_FLOOR:
+        return f"{gb} GB is below the {POOL_GB_FLOOR} GB floor; keeping {state.pool_gb} GB."
+    state.pool_gb = gb
+    return f"pool size set to {gb} GB (applies to the next `chat`/`run`)."
+
+
+def _status_lines(s: dict[str, Any]) -> list[str]:
+    """Multi-line status block for the REPL ``/status`` (mirrors the shell ``status`` fields)."""
+    reach = int(s["reach_tokens"])
+    return [
+        f"  pool:        {s['pool_gb']} GB  (reach ~= {reach / 1e9:.2f}B tokens)",
+        f"  slices:      {s['slices_used']} / {s['capacity']}",
+        f"  reach:       {reach:,} tokens",
+        f"  hit rate:    {float(s['hit_rate']):.0%}",
+        f"  resident RAM ~= {s['resident_ram_mb']} MB (estimate)",
+        f"  pool-mode:   {s['pool_mode']}",
+        f"  index:       {s['index']}",
+        f"  model:       {s['model']}    extended: {s['extended']}",
+    ]
+
+
+def _bind_readline_clear() -> None:
+    """Best-effort: bind Ctrl+L to insert ``/clear`` via readline (no-op if unavailable)."""
+    try:
+        import readline  # noqa: PLC0415 - optional, best-effort on this platform
+    except ImportError:
+        return
+    bind = getattr(readline, "parse_and_bind", None)
+    if bind is None:
+        return
+    try:
+        bind(r'"\C-l": "/clear\n"')
+    except (OSError, ValueError) as exc:
+        # readline present but the binding syntax was rejected on this build — non-fatal.
+        print(f"  (note: could not bind Ctrl+L: {exc})", file=sys.stderr)
+
+
+def _drop_ephemeral(args: argparse.Namespace, session: Session) -> None:
+    """On exit, close the session; in separate/ephemeral mode also drop its slices.
+
+    Honest cleanup: ``separate`` mode is ephemeral, so the slices this chat encoded are
+    dropped on exit (the next chat starts clean). ``shared`` / a persistent dir keeps them.
+    """
+    if args.pool_mode == "separate":
+        try:
+            session.clear(scope="session")
+        except AetherContextError as exc:
+            print(f"  (note: ephemeral clear skipped: {exc})", file=sys.stderr)
+    session.close()
 
 
 # ---------------------------------------------------------------------------
@@ -479,4 +944,8 @@ def _load_bench_module() -> ModuleType | None:
     return None
 
 
-__all__ = ["main", "build_parser"]
+__all__ = ["main", "build_parser", "dispatch_slash", "ReplState", "SLASH_ACTIONS"]
+
+
+if __name__ == "__main__":  # pragma: no cover - exercised via `python -m aether_context.cli`
+    sys.exit(main())

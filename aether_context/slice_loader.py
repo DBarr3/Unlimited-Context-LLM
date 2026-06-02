@@ -370,6 +370,30 @@ class Pager:
             self._lastused.pop(k, None)
         return len(drop)
 
+    @property
+    def default_k(self) -> int:
+        """How many slices the cold path pulls per region by default (the resident width)."""
+        return self._default_k
+
+    @default_k.setter
+    def default_k(self, value: int) -> None:
+        """Set the resident width (floored at 1). Used by the Extended-Thinking toggle."""
+        self._default_k = max(1, int(value))
+
+    def reset(self) -> int:
+        """Drop the entire resident window (every warm key); return how many were dropped.
+
+        This is the *resident* half of the engine's clear semantics: it empties the working
+        set the model would be handed this turn, leaving the pool (the reachable slices on
+        disk) completely untouched. The next :meth:`get` / :meth:`prefetch_from` re-reads
+        fresh from the pool. Hit/miss counters are left intact so a measured hit rate is not
+        forged by a clear. Returns the number of warm keys evicted (``0`` when already empty).
+        """
+        dropped = len(self._warm)
+        self._warm.clear()
+        self._lastused.clear()
+        return dropped
+
     def is_warm(self, key: SliceKey) -> bool:
         """Whether ``key`` currently has a resident warm entry."""
         return key in self._warm

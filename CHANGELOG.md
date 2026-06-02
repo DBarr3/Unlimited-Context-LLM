@@ -25,7 +25,10 @@ pool — local-first, numpy-only core.
   session loop.
 - `Session(fallback_to_mock=True)` — degrades to the mock model with a visible warning when a backend
   can't be loaded, so a clean-clone / offline run never crashes.
-- `aether-context` CLI: `init`, `--pool`, `doctor`, `bench`.
+- `aether-context` CLI: `init`, `run "<task>"`, `chat` (REPL slash-commands `/clear` `/cls`
+  `/new` `/status` `/pool` `/model` `/think` `/export` `/help` `/quit`), `status`, `clear` /
+  `clear --all` (honest resident-vs-pool semantics, confirm on shared/persistent), `doctor`,
+  `bench`, plus `--pool` / `--pool-mode {separate,shared}` / `--index {flat,hnsw,tiered}` / `--model`.
 - `bench/drift_vs_window.py` — head-to-head engine ON vs OFF (drift / correctness / hit rate /
   completion), hermetic via `MockLLM`.
 - `atlas_client.py` — thin, optional, off-by-default client of the hosted AetherCloud API. Calls it;

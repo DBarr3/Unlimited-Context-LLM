@@ -46,8 +46,8 @@ from typing import Any, Iterator
 import numpy as np
 
 from aether_context._log import get_logger
-from aether_context.config import PoolConfig, SessionConfig
-from aether_context.context_pool import ContextPool, Slice
+from aether_context.config import PoolConfig, SessionConfig, reach_tokens
+from aether_context.context_pool import ContextPool, Slice, slice_cost_bytes
 from aether_context.encoder import StaticEncoder
 from aether_context.errors import (
     AetherContextError,
@@ -70,6 +70,13 @@ _SPILL_SALIENCE_FLOOR: float = 0.30
 _REMEMBER_SALIENCE: float = 0.95
 #: Topic label assigned to the running reasoning region (the pager's working-set key).
 _REASONING_TOPIC: str = "reasoning"
+#: Resident in-RAM index estimate, MB per GB of reach (mirrors the README table / CLI's
+#: _INDEX_MB_PER_GB: ~145 MB at 5 GB). Used only for the honest status RAM estimate.
+_RESIDENT_RAM_MB_PER_GB: int = 29
+#: Default transcript export filename (timestamp-free, written under cwd).
+_DEFAULT_TRANSCRIPT_NAME: str = "aether-transcript.txt"
+#: How much the Extended-Thinking toggle widens the resident working set (mock-honest).
+_EXTENDED_RESIDENT_BONUS: int = 8
 
 
 # ---------------------------------------------------------------------------
@@ -141,6 +148,7 @@ class Session:
         fallback_to_mock: bool = True,
         pool_dir: "str | Path | None" = None,
         pool_index: str = "flat",
+        pool_mode: str = "separate",
         context_window: int | None = None,
         output_tokens: int | None = None,
         resident_k: int = DEFAULT_RESIDENT_K,
@@ -152,6 +160,16 @@ class Session:
         self.id: str = session_id or f"sess-{uuid.uuid4().hex[:12]}"
         self._closed: bool = False
         self._resident_k: int = max(1, int(resident_k))
+        # Pool sharing discipline. "separate" (default) keeps every search/encode scoped to
+        # THIS session's namespace, so two sessions over one dir never see each other's
+        # slices. "shared" makes reach global (search/encode with session=None) so a named or
+        # persistent pool can be read across sessions. The PoolConfig records the same mode.
+        self.pool_mode: str = pool_mode
+        # Extended-Thinking toggle (honest): in the mock it only widens the resident set and
+        # surfaces in status; it is never a silent capability claim.
+        self.extended: bool = False
+        # Conversation transcript: one (role, text) tuple per ask()/run() turn, used by export().
+        self._transcript: list[tuple[str, str]] = []
         # Moat-safe seam: None by default (fully local). Only set if the caller opts in.
         self.atlas_client: Any | None = atlas_client
 
@@ -174,20 +192,29 @@ class Session:
         # -- the pool ("disk") ------------------------------------------------
         pool_config = PoolConfig(
             pool_gb=pool_gb,
+            mode=pool_mode,
             index=pool_index,
             dir=Path(pool_dir) if pool_dir is not None else PoolConfig().dir,
         )
         self.pool: ContextPool = ContextPool(
             pool_config, ceiling_bytes=pool_ceiling_bytes
         )
+        # Retain the reach (GB) for honest status reporting without reaching into pool internals.
+        self.pool_gb: int = int(pool_config.pool_gb)
 
         # -- encoder ("encode-on-spill") --------------------------------------
         self.encoder: StaticEncoder = StaticEncoder(dim=pool_config.dim)
 
         # -- witness (page-replacement) + pager (the pager) -------------------
+        # In "shared" mode the cold path searches globally (session=None) so the resident
+        # window can draw on slices from any session; "separate" keeps the default
+        # session-scoped cold path (key.session) so namespaces never bleed.
         self.witness: Witness = Witness()
         self.pager: Pager = Pager(
-            self.pool, self.encoder, default_k=self._resident_k
+            self.pool,
+            self.encoder,
+            default_k=self._resident_k,
+            retrieve_fn=self._cold_retrieve,
         )
 
         # -- run state --------------------------------------------------------
@@ -267,6 +294,19 @@ class Session:
         """The pager key for this session's region under ``topic``."""
         return SliceKey(session=self.id, topic=topic)
 
+    def _scope(self) -> str | None:
+        """The session id this session's searches are scoped to, or ``None`` when shared.
+
+        ``"separate"`` (default) scopes every search/encode to :attr:`id` so two sessions
+        over one pool dir stay isolated. ``"shared"`` returns ``None`` so the search spans
+        every session's slices (global reach across sessions).
+        """
+        return None if self.pool_mode == "shared" else self.id
+
+    def _cold_retrieve(self, key: SliceKey, query_vec: np.ndarray, k: int) -> list[Slice]:
+        """Pager cold path honoring the session's pool mode (shared -> global search)."""
+        return self.pool.search(query_vec, k, session=self._scope())
+
     # -- plant / recover a fact -----------------------------------------------
     def remember(self, text: str, *, tags: dict[str, Any] | None = None) -> Slice | None:
         """Encode ``text`` as a high-salience slice into the pool (a load-bearing fact).
@@ -298,12 +338,13 @@ class Session:
             logger.warning("recall encode failed (%s); returning no local hits", exc)
             return []
         try:
-            scoped = self.pool.search(qvec, k, session=self.id)
+            scoped = self.pool.search(qvec, k, session=self._scope())
             if scoped:
                 return scoped
             # Reopen case: a fresh Session over an existing pool dir has a new session id, so
             # the prior run's slices live under a different namespace. Fall back to a global
             # search so a disk-resident fact is still recoverable after a close + reopen.
+            # (In shared mode the scoped search is already global, so this is a harmless re-run.)
             return self.pool.search(qvec, k, session=None)
         except AetherContextError as exc:
             logger.warning("recall pool search failed (%s); returning no local hits", exc)
@@ -393,7 +434,7 @@ class Session:
         """Cheap near-neighbor count for uniqueness scoring (fail-soft, best-effort)."""
         try:
             qvec = self.encoder.encode(text)
-            hits = self.pool.search(qvec, k=4, session=self.id)
+            hits = self.pool.search(qvec, k=4, session=self._scope())
         except AetherContextError:
             return 0
         # count strongly-similar resident slices (cosine > 0.9)
@@ -421,6 +462,11 @@ class Session:
 
         # paged reason: warm the working set from the final reasoning text (fail-soft).
         self._page_working_set(task + "\n" + text, stages)
+
+        # Record the turn for export(): the user task then the model's reply (ask() funnels
+        # through run(), so logging here covers both without double-counting).
+        self._transcript.append(("user", task))
+        self._transcript.append(("assistant", text))
 
         stages.append({"stage": "complete", "out_tokens": self._count_tokens(text)})
         return RunResult(
@@ -586,6 +632,83 @@ class Session:
         hosted). Returned as a shallow copy so the caller cannot mutate session state.
         """
         return list(self._harvest)
+
+    # -- clear / export / extended-thinking / status --------------------------
+    def clear(self, scope: str = "session") -> int:
+        """Clear resident and (optionally) externalized state. Returns slices removed.
+
+        Two honest scopes:
+
+        * ``"resident"`` — empty only the in-memory resident window (the pager's warm set).
+          The reachable pool on disk is untouched, so this is :meth:`/new`: a fresh window
+          over the same reach. Always returns ``0`` (no pool slices were dropped).
+        * ``"session"`` (default) — also drop the slices THIS session externalized into the
+          pool. In ``"shared"`` mode the pool is global, so this empties the whole pool
+          (every session's slices). Returns the count of pool slices removed.
+
+        Resetting the witness keeps retention ranking consistent with the now-smaller pool.
+        Fail-soft: an empty/absent pool simply removes nothing.
+        """
+        if scope not in ("resident", "session"):
+            raise AetherContextError(
+                f"clear scope must be 'resident' or 'session', got {scope!r}.",
+                hint="Use scope='resident' (window only) or scope='session' (window + slices).",
+            )
+        self.pager.reset()
+        if scope == "resident":
+            return 0
+        # session scope: drop this session's pool slices (or all of them when shared).
+        return self.pool.clear_session(self._scope())
+
+    def export(self, path: str | None = None) -> str:
+        """Write the conversation transcript to ``path`` and return the path written.
+
+        With no ``path`` the transcript is written to ``aether-transcript.txt`` under the
+        current working directory (timestamp-free, so re-export overwrites in place). Each
+        turn is rendered as ``role: text`` on its own block. Returns the resolved path as a
+        string so a caller (the REPL ``/export``) can report exactly where it landed.
+        """
+        target = Path(path) if path else Path.cwd() / _DEFAULT_TRANSCRIPT_NAME
+        lines = [f"{role}: {text}" for role, text in self._transcript]
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("\n\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+        return str(target)
+
+    def toggle_extended(self) -> bool:
+        """Flip the Extended-Thinking toggle and return its new value (honest, mock-safe).
+
+        In the mock backend this only widens the resident working set (more slices paged in
+        per turn) and surfaces in :meth:`status_dict`; it never silently changes the model's
+        real capability. Returns the toggle's new state so a REPL can report ``on``/``off``.
+        """
+        self.extended = not self.extended
+        bonus = _EXTENDED_RESIDENT_BONUS if self.extended else 0
+        self.pager.default_k = self._resident_k + bonus
+        return self.extended
+
+    def status_dict(self) -> dict[str, Any]:
+        """A snapshot of the session's state for the ``status`` command (all honest).
+
+        Fields: ``pool_gb`` (reach in GB), ``slices_used`` / ``capacity`` (governor budget),
+        ``reach_tokens``, ``hit_rate`` (the pager's measured rate), ``resident_ram_mb``
+        (estimate ~29 MB/GB of reach), ``pool_mode``, ``index`` (the resolved kind actually
+        in use), ``model`` (the backend name), and ``extended`` (the toggle state).
+        """
+        stats = self.pool.stats()
+        cost = slice_cost_bytes(int(stats["dim"]))
+        capacity = self.pool.ceiling_bytes // cost if cost else 0
+        return {
+            "pool_gb": self.pool_gb,
+            "slices_used": int(stats["count"]),
+            "capacity": int(capacity),
+            "reach_tokens": reach_tokens(self.pool_gb),
+            "hit_rate": self.pager.hit_rate(),
+            "resident_ram_mb": self.pool_gb * _RESIDENT_RAM_MB_PER_GB,
+            "pool_mode": self.pool_mode,
+            "index": stats["index"],
+            "model": getattr(self.local_llm, "name", str(self.config.model)),
+            "extended": self.extended,
+        }
 
     # -- close + context manager ----------------------------------------------
     def close(self) -> None:

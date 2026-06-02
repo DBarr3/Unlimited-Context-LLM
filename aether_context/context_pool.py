@@ -399,6 +399,36 @@ class ContextPool:
             )
         return evict_ids
 
+    def clear_session(self, session_id: str | None) -> int:
+        """Remove every live slice belonging to ``session_id`` and return the count removed.
+
+        This is the storage half of the engine's *clear* semantics: dropping the slices a
+        single session externalized into the pool. When ``session_id`` is ``None`` the whole
+        pool is emptied (the shared/global clear), so a ``shared`` pool clears all sessions.
+
+        Rows are compacted after removal so ``_live_matrix`` stays a dense prefix and the
+        sidecar row indices remain consistent; the byte accounting and stats follow the
+        surviving slices exactly. Returns ``0`` when nothing matched (idempotent, safe).
+        """
+        if session_id is None:
+            removed = list(self._order)
+        else:
+            removed = [
+                sid for sid in self._order
+                if self._slices[sid].session == session_id
+            ]
+        if not removed:
+            return 0
+        for sid in removed:
+            self._remove(sid)
+        self._compact_rows()
+        self._dirty = True
+        self._index_dirty = True
+        logger.debug(
+            "cleared %d slice(s) for session %r", len(removed), session_id
+        )
+        return len(removed)
+
     def _remove(self, sid: str) -> None:
         """Drop a single slice id from the in-RAM structures (mmap row reclaimed on compact)."""
         self._slices.pop(sid, None)
