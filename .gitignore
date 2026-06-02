@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+.eggs/
+
+# Build / dist
+build/
+dist/
+wheels/
+*.whl
+
+# Test / type caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+
+# Virtual environments
+.venv/
+venv/
+venv*/
+env/
+ENV/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Internal / confidential — NEVER publish (moat + internal planning docs)
+qosc/
+JOURNAL.md
+UNLIMITED_CONTEXT_BUILD_PLAN.md
+UNLIMITED_CONTEXT_REPO_DESIGN.md
+UNLIMITED_CONTEXT_README.md
