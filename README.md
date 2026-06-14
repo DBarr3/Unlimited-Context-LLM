@@ -242,6 +242,21 @@ That's the whole thing. One small model, one command, a billion tokens of reach 
 
 "Unlimited" means **reach, not attention.** Your model keeps its native window — we make it *reach* a billion-token pool in slices, via fast retrieval. The whole thing rides on retrieval **hit rate**; when it's high (and the loader is built to keep it high), the pool feels like one seamless context.
 
+## Benchmark — measured, on a real model
+
+A live run on **`deepseek/deepseek-v4-pro`** (via OpenRouter), driving an agent through **60 real GitHub issues** over a **40-turn session that overflows the model's window** — engine **on** vs **off** (off = no engine, same model, transcript truncated to the window). Full write-up: [`docs/benchmarks/2026-06-14-deepseek-v4-pro-session-eval.md`](docs/benchmarks/2026-06-14-deepseek-v4-pro-session-eval.md).
+
+| Metric | Off (baseline) | On (engine) | Change |
+|---|:---:|:---:|:---:|
+| **Recall coherence** (early facts still correct) | 0.15 | **1.00** | **+567%** (6.7×) |
+| **Work outcome** (tasks done right) | 3 / 20 | **20 / 20** | **+567%** |
+| **Cost — full session** | $0.0711 | **$0.0542** | **−24%** |
+| **Cost — back half (recall phase)** | $0.00117/turn | **$0.00053/turn** | **−54%** |
+
+What the engine provided, in one session: it **held coherence flat at 1.00 while the baseline drifted to 0.15** (early issues fell out of the window and were lost), turned a **3/20 failing run into 20/20**, and did it for **~25% less money overall — over half off in the back half**, where the baseline drags a bloated transcript into every call and the engine sends a compact recalled window. Total spend for the whole benchmark: **$0.19**.
+
+<sub>Single-fact recall task; the MPO chain ties plain recall here (its edge is multi-slice connected threads — see the report). Reproduce: `python -m bench.api_eval --model deepseek/deepseek-v4-pro --repo microsoft/vscode --arms off,on,on_chain --plot`.</sub>
+
 ## Citation
 
 If Unlimited Context helps your work, please cite it. Built and maintained by **Aether AI**.
