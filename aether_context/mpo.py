@@ -1,209 +1,206 @@
 # aether-context (Unlimited Context)
 # Copyright (c) 2026 Aether AI
 # SPDX-License-Identifier: Apache-2.0
-"""MPO codec — a tensor-train (Matrix Product Operator) encoder/decoder for pool vectors.
+"""MPO context chain — links the session's slices and assists retrieval.
 
-Unlimited Context is virtual memory for attention: overflow is **encoded** to a local pool
-and the right slice is **recovered** on demand. This module is the numeric half of that
-contract — it compresses a slice's retrieval vector into a **tensor-train (TT)** factorization
-on the way to disk and reconstructs it on recovery, so a long-running session's persistent
-pool holds more reach per byte.
+Cosine/semantic search is the retrieval mechanism; this does not replace it. The MPO
+(Matrix Product Operator) chain is a **coupling layer** over the slices: when cosine pulls an
+entry slice, the chain pulls in the slices most coupled to it, **widening the working set with
+connected context** (the thread) instead of isolated nearest-neighbors.
 
-The technique is the standard **TT-SVD** decomposition (Oseledets, 2011): a length-``D``
-vector is reshaped into a small multi-axis grid and factored into a chain of rank-bounded
-3-D cores; truncating the bond rank trades a bounded amount of reconstruction error for a
-smaller stored footprint. It is pure, deterministic linear algebra — no training, no model,
-numpy only.
+Coupling is ranked on **two session-local constants** — **cost** and **time** — and nothing
+else. ``time`` is the slice's position in the session; ``cost`` is its token cost, discounted
+when the slice is already cached (``cost/cache``). The two constants are lifted to small Fourier
+features and contracted through a 2-site tensor train (the MPO) into a shared **chain manifold**;
+coupling = semantic similarity gated by closeness on that manifold.
 
-What it is / is not
--------------------
-  * It *is* a lossy, bounded vector codec: ``recover(encode(v))`` returns an approximation of
-    ``v`` whose fidelity (cosine to the original) rises with the bond ``rank``. Both the
-    compression ratio and the measured fidelity are reported, never assumed.
-  * It is *only* encode + recover. It does not rank, score, gate, or judge slices, and it has
-    no notion of relevance, ground truth, or correctness — those are the retrieval/witness
-    layers' jobs. The codec's sole purpose is making the disk/memory encoding smaller.
-  * It is opt-in and fail-soft at the call sites that use it: the engine always works with the
-    raw vectors; the codec is a footprint optimization, never a correctness dependency.
+It is fixed, deterministic, numpy-only linear algebra (seeded cores, no training) and purely
+additive: it only ever *adds* connected slices to a retrieval result, never blocks or replaces a
+hit, so any failure degrades cleanly to plain cosine retrieval.
 """
 from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from math import prod
-from typing import List, Sequence, Tuple
+from typing import Sequence
 
 import numpy as np
 
 log = logging.getLogger("aether_context.mpo")
 
-#: Default retrieval-vector dimensionality the codec factors (the 256-dim embedding).
-DEFAULT_DIM: int = 256
-#: Default factorization grid for D=256 (4*4*4*4). More, smaller modes = more cores to share
-#: the bond budget = better compression at a given rank. Must multiply to the vector dim.
-DEFAULT_MODE_SHAPE: Tuple[int, ...] = (4, 4, 4, 4)
-#: Default maximum bond (TT) rank. Caps every internal bond; lower = smaller + lossier.
-DEFAULT_RANK: int = 4
-
-
-def _factor_default(dim: int) -> Tuple[int, ...]:
-    """A reasonable near-square factorization grid for ``dim`` (used when none is given)."""
-    if dim == DEFAULT_DIM:
-        return DEFAULT_MODE_SHAPE
-    # Greedy small-factor split; falls back to a single mode for primes.
-    modes: List[int] = []
-    remaining = dim
-    for p in (2, 3, 5, 7, 11, 13):
-        while remaining % p == 0 and remaining > 1:
-            modes.append(p)
-            remaining //= p
-    if remaining > 1:
-        modes.append(remaining)
-    return tuple(modes) if modes else (dim,)
+#: Fourier features per axis (lifts each scalar constant to a smooth feature vector).
+DEFAULT_FEATURE_DIM: int = 8
+#: Tensor-train bond dimension between the two MPO sites.
+DEFAULT_BOND: int = 4
+#: Dimensionality of the chain embedding the MPO emits.
+DEFAULT_EMBED_DIM: int = 4
+#: How much cheaper a cached (resident) slice is to chain in: cost_eff = cost / (1 + bonus·cached).
+DEFAULT_CACHE_BONUS: float = 1.0
+#: Default coupled slices pulled per hop, and how many hops to follow the chain.
+DEFAULT_CHAIN_WIDTH: int = 8
+DEFAULT_CHAIN_HOPS: int = 1
 
 
 @dataclass(frozen=True)
-class TTVector:
-    """A tensor-train-encoded vector: the ordered cores plus the grid they decompose.
+class ChainItem:
+    """A retrieval candidate as the chain sees it: id + unit vector + the 2 constants.
 
-    ``cores[k]`` has shape ``(r_k, mode_shape[k], r_{k+1})`` with ``r_0 == r_last == 1``.
-    ``param_count`` is the total stored floats (the compressed size); ``recover`` contracts
-    the chain back to the original-length vector.
+    ``cost`` is the raw token cost, ``time`` the raw session position (both normalized over the
+    candidate set inside :meth:`MpoChain.expand`). ``cached`` discounts the cost.
     """
 
-    cores: Tuple[np.ndarray, ...]
-    mode_shape: Tuple[int, ...]
+    id: str
+    vector: np.ndarray
+    cost: float
+    time: float
+    cached: bool = False
 
-    @property
-    def param_count(self) -> int:
-        return int(sum(c.size for c in self.cores))
+
+def _fourier(x: float, p: int) -> np.ndarray:
+    """Lift a scalar ``x`` (expected in [0,1]) to a ``p``-dim smooth Fourier feature vector."""
+    half = max(1, p // 2)
+    ks = np.arange(1, half + 1, dtype=np.float64)
+    feats = np.concatenate([np.sin(np.pi * ks * x), np.cos(np.pi * ks * x)])
+    if feats.size < p:  # pad odd p
+        feats = np.concatenate([feats, np.zeros(p - feats.size)])
+    return feats[:p]
 
 
-class MpoCodec:
-    """Tensor-train vector codec: ``encode`` to cores, ``recover`` back. numpy-only, stateless.
+def _unit(v: np.ndarray) -> np.ndarray:
+    n = float(np.linalg.norm(v))
+    return v if n < 1e-12 else v / n
 
-    Construct with the vector ``dim``, an optional factorization ``mode_shape`` (must multiply
-    to ``dim``), and a maximum bond ``rank``. The codec holds no per-vector state — it is safe
-    to share one instance across a whole pool.
-    """
+
+def _cos(a: np.ndarray, b: np.ndarray) -> float:
+    na, nb = float(np.linalg.norm(a)), float(np.linalg.norm(b))
+    if na < 1e-12 or nb < 1e-12:
+        return 0.0
+    return float(np.dot(a, b) / (na * nb))
+
+
+class MpoChain:
+    """The 2-site MPO that couples slices on (cost, time) and expands a hit to its thread."""
 
     def __init__(
         self,
-        dim: int = DEFAULT_DIM,
         *,
-        mode_shape: Sequence[int] | None = None,
-        rank: int = DEFAULT_RANK,
+        feature_dim: int = DEFAULT_FEATURE_DIM,
+        bond: int = DEFAULT_BOND,
+        embed_dim: int = DEFAULT_EMBED_DIM,
+        seed: int = 0,
+        cache_bonus: float = DEFAULT_CACHE_BONUS,
+        width: int = DEFAULT_CHAIN_WIDTH,
+        hops: int = DEFAULT_CHAIN_HOPS,
     ) -> None:
-        if not isinstance(dim, int) or dim <= 0:
-            raise ValueError(f"dim must be a positive int, got {dim!r}")
-        shape = tuple(int(m) for m in (mode_shape if mode_shape is not None else _factor_default(dim)))
-        if prod(shape) != dim:
-            raise ValueError(
-                f"mode_shape {shape} multiplies to {prod(shape)}, not dim={dim}"
-            )
-        if rank < 1:
-            raise ValueError(f"rank must be >= 1, got {rank}")
-        self.dim = dim
-        self.mode_shape = shape
-        self.rank = int(rank)
+        rng = np.random.default_rng(seed)
+        p = int(feature_dim)
+        self.feature_dim = p
+        self.bond = int(bond)
+        self.embed_dim = int(embed_dim)
+        self.cache_bonus = max(0.0, float(cache_bonus))
+        self.width = max(1, int(width))
+        self.hops = max(1, int(hops))
+        # 2-site tensor train: site A consumes the time axis, site B the cost axis.
+        self._core_a = (rng.standard_normal((1, p, self.bond)) * 0.5).astype(np.float64)
+        self._core_b = (rng.standard_normal((self.bond, p, self.embed_dim)) * 0.5).astype(np.float64)
 
-    # -- encode (TT-SVD) -------------------------------------------------------
-    def encode(self, vector: np.ndarray) -> TTVector:
-        """Compress a ``(dim,)`` vector into a rank-bounded tensor train via TT-SVD.
+    # -- the MPO contraction ---------------------------------------------------
+    def chain_embed(self, cost: float, time: float) -> np.ndarray:
+        """Map the two constants to a unit chain embedding via the 2-site tensor train."""
+        u = _fourier(float(time), self.feature_dim)   # time axis -> site A
+        v = _fourier(float(cost), self.feature_dim)   # cost axis -> site B
+        a = np.einsum("aib,i->ab", self._core_a, u)[0]      # (bond,)
+        e = np.einsum("b,bjm,j->m", a, self._core_b, v)     # (embed_dim,)
+        return _unit(e)
 
-        Sequentially unfolds the reshaped tensor and truncates each bond to at most ``rank``
-        singular values. Deterministic; the same vector always yields the same cores.
+    # -- coupling --------------------------------------------------------------
+    def coupling(self, vec_i, e_i, vec_h, e_h) -> float:
+        """Semantic similarity gated by chain proximity, in roughly [0,1] for unit inputs."""
+        sem = _cos(np.asarray(vec_i), np.asarray(vec_h))
+        chain = _cos(e_i, e_h)
+        return sem * (0.5 + 0.5 * chain)
+
+    # -- expansion (assist the retrieval) --------------------------------------
+    def expand(
+        self,
+        hit_ids: Sequence[str],
+        candidates: Sequence[ChainItem],
+        *,
+        width: int | None = None,
+        hops: int | None = None,
+    ) -> list[str]:
+        """Widen ``hit_ids`` with the candidates most coupled to them — follow the chain.
+
+        Normalizes cost/time over ``candidates`` (cost discounted for cached items), embeds each
+        on the chain manifold, then repeatedly pulls the top-``width`` most-coupled candidates to
+        the current frontier for ``hops`` hops. Returns ordered ids: the hits first (in their
+        given order), then the coupled slices in pull order, de-duplicated.
         """
-        v = np.asarray(vector, dtype=np.float64).ravel()
-        if v.size != self.dim:
-            raise ValueError(f"vector has {v.size} elements, expected dim={self.dim}")
-        cores: List[np.ndarray] = []
-        c = v.reshape(self.mode_shape)
-        r_prev = 1
-        d = len(self.mode_shape)
-        for k in range(d - 1):
-            n_k = self.mode_shape[k]
-            c = c.reshape(r_prev * n_k, -1)
-            u, s, vt = np.linalg.svd(c, full_matrices=False)
-            r = int(min(self.rank, s.size))
-            u = u[:, :r]
-            s = s[:r]
-            vt = vt[:r, :]
-            cores.append(u.reshape(r_prev, n_k, r).copy())
-            c = (s[:, None] * vt)  # fold singular values into the carry (shape (r, rest))
-            r_prev = r
-        cores.append(c.reshape(r_prev, self.mode_shape[-1], 1).copy())
-        return TTVector(cores=tuple(cores), mode_shape=self.mode_shape)
+        items = list(candidates)
+        if not items:
+            return list(hit_ids)
+        width = self.width if width is None else max(1, int(width))
+        hops = self.hops if hops is None else max(1, int(hops))
 
-    # -- recover (contraction) -------------------------------------------------
-    def recover(self, tt: TTVector) -> np.ndarray:
-        """Contract a tensor train back into a ``(dim,)`` float32 vector (an approximation)."""
-        res = tt.cores[0].reshape(tt.cores[0].shape[1], tt.cores[0].shape[2])  # (n0, r1)
-        for core in tt.cores[1:]:
-            r_prev, n_k, r_next = core.shape
-            res = res.reshape(-1, r_prev) @ core.reshape(r_prev, n_k * r_next)
-            res = res.reshape(-1, r_next)
-        return res.reshape(-1).astype(np.float32)
+        # Normalize the two constants over the candidate set; discount cached cost.
+        costs = np.array(
+            [it.cost / (1.0 + self.cache_bonus * (1.0 if it.cached else 0.0)) for it in items],
+            dtype=np.float64,
+        )
+        times = np.array([it.time for it in items], dtype=np.float64)
+        cost_n = _minmax(costs)
+        time_n = _minmax(times)
+        embeds = {it.id: self.chain_embed(cost_n[i], time_n[i]) for i, it in enumerate(items)}
+        by_id = {it.id: it for it in items}
 
-    # -- accounting / fidelity -------------------------------------------------
-    def compression_ratio(self, tt: TTVector | None = None) -> float:
-        """Stored-floats ratio ``dim / param_count``. >1 means smaller than the raw vector.
+        present_hits = [h for h in hit_ids if h in by_id]
+        if not present_hits:
+            present_hits = [items[0].id]
+        selected: list[str] = []
+        seen: set[str] = set()
+        for h in present_hits:
+            if h not in seen:
+                selected.append(h)
+                seen.add(h)
+        frontier = list(selected)
 
-        With no ``tt`` argument, returns the worst-case ratio for a full-rank encode (every
-        bond saturated at ``rank``), the honest floor a caller can expect.
-        """
-        if tt is not None:
-            return self.dim / max(1, tt.param_count)
-        # Worst case: every bond hits the rank cap (bounded by the adjacent unfolding sizes).
-        r_prev = 1
-        params = 0
-        left = 1
-        for k, n_k in enumerate(self.mode_shape):
-            if k < len(self.mode_shape) - 1:
-                left *= n_k
-                right = self.dim // left
-                r = int(min(self.rank, left, right))
-            else:
-                r = 1
-            params += r_prev * n_k * r
-            r_prev = r
-        return self.dim / max(1, params)
+        for _ in range(hops):
+            scored: list[tuple[float, str]] = []
+            for it in items:
+                if it.id in seen:
+                    continue
+                best = max(
+                    self.coupling(it.vector, embeds[it.id], by_id[h].vector, embeds[h])
+                    for h in frontier
+                )
+                scored.append((best, it.id))
+            if not scored:
+                break
+            scored.sort(key=lambda p: p[0], reverse=True)
+            picked = [sid for _, sid in scored[:width]]
+            for sid in picked:
+                if sid not in seen:
+                    selected.append(sid)
+                    seen.add(sid)
+            frontier = picked
+        return selected
 
-    def fidelity(self, vector: np.ndarray, tt: TTVector | None = None) -> float:
-        """Cosine similarity between ``vector`` and its round-trip reconstruction in ``[-1,1]``."""
-        v = np.asarray(vector, dtype=np.float64).ravel()
-        rec = np.asarray(self.recover(tt if tt is not None else self.encode(v)), dtype=np.float64)
-        nv = float(np.linalg.norm(v))
-        nr = float(np.linalg.norm(rec))
-        if nv < 1e-12 or nr < 1e-12:
-            return 0.0
-        return float(np.dot(v, rec) / (nv * nr))
 
-    # -- serde -----------------------------------------------------------------
-    @staticmethod
-    def tt_to_lists(tt: TTVector) -> dict:
-        """Serialize a :class:`TTVector` to JSON-safe nested lists (for the pool sidecar)."""
-        return {"mode_shape": list(tt.mode_shape), "cores": [c.tolist() for c in tt.cores]}
-
-    @staticmethod
-    def tt_from_lists(data: dict) -> TTVector:
-        """Rebuild a :class:`TTVector` from :meth:`tt_to_lists` output."""
-        cores = tuple(np.asarray(c, dtype=np.float64) for c in data["cores"])
-        return TTVector(cores=cores, mode_shape=tuple(int(m) for m in data["mode_shape"]))
-
-    def to_dict(self) -> dict:
-        """Serialize the codec configuration (not per-vector data)."""
-        return {"dim": self.dim, "mode_shape": list(self.mode_shape), "rank": self.rank}
-
-    @classmethod
-    def from_dict(cls, data: dict) -> "MpoCodec":
-        return cls(int(data["dim"]), mode_shape=data.get("mode_shape"), rank=int(data.get("rank", DEFAULT_RANK)))
+def _minmax(x: np.ndarray) -> np.ndarray:
+    """Min-max normalize to [0,1]; a flat array maps to 0.5 (no spurious gradient)."""
+    lo, hi = float(x.min()), float(x.max())
+    if hi - lo < 1e-12:
+        return np.full_like(x, 0.5)
+    return (x - lo) / (hi - lo)
 
 
 __all__ = [
-    "MpoCodec",
-    "TTVector",
-    "DEFAULT_DIM",
-    "DEFAULT_MODE_SHAPE",
-    "DEFAULT_RANK",
+    "MpoChain",
+    "ChainItem",
+    "DEFAULT_FEATURE_DIM",
+    "DEFAULT_BOND",
+    "DEFAULT_EMBED_DIM",
+    "DEFAULT_CACHE_BONUS",
+    "DEFAULT_CHAIN_WIDTH",
+    "DEFAULT_CHAIN_HOPS",
 ]

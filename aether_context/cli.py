@@ -104,14 +104,6 @@ def build_parser() -> argparse.ArgumentParser:
         "init", help="initialize the pool (interactive slider on a tty; else --pool/env/5GB)."
     )
     p_init.add_argument("--pool", type=int, default=None, metavar="N", help="pool size in GB (>=5).")
-    p_init.add_argument(
-        "--vector-codec", type=str, default=None, choices=_VECTOR_CODECS, metavar="{none,mpo}",
-        help="on-disk vector codec for this pool. 'mpo' = tensor-train compression (more reach).",
-    )
-    p_init.add_argument(
-        "--codec-rank", type=int, default=None, metavar="N",
-        help="MPO codec bond rank (higher = better fidelity, less compression).",
-    )
     p_init.add_argument("--dir", type=str, default=None, metavar="D", help="pool directory.")
 
     p_doctor = subparsers.add_parser(
@@ -163,7 +155,6 @@ def build_parser() -> argparse.ArgumentParser:
 #: Allowed values for the session-config flags (mirror PoolConfig's validators).
 _POOL_MODES = ("separate", "shared")
 _INDEX_KINDS = ("flat", "hnsw", "tiered")
-_VECTOR_CODECS = ("none", "mpo")
 #: Default model for the run/chat surface — offline-safe so a clean clone just works.
 _DEFAULT_MODEL = "mock"
 
@@ -187,14 +178,8 @@ def _add_session_flags(sub: argparse.ArgumentParser) -> None:
         help="ANN index kind (default: flat). 'tiered' is reserved and runs flat for now.",
     )
     sub.add_argument(
-        "--vector-codec", type=str, default=None, choices=_VECTOR_CODECS,
-        metavar="{none,mpo}",
-        help="on-disk vector codec. 'mpo' compresses the pool's vectors as a tensor train and "
-             "recovers them on load (more reach per byte). Default honors the saved config.",
-    )
-    sub.add_argument(
-        "--codec-rank", type=int, default=None, metavar="N",
-        help="MPO codec bond rank (higher = better fidelity, less compression).",
+        "--no-mpo-chain", dest="mpo_chain", action="store_false", default=True,
+        help="disable the MPO context chain (retrieval falls back to plain cosine). On by default.",
     )
     sub.add_argument("--dir", type=str, default=None, metavar="D", help="pool directory.")
 
@@ -251,17 +236,11 @@ def _cmd_init(args: argparse.Namespace) -> int:
     pool_dir = _resolve_dir(args.dir)
     pool_gb = _resolve_pool_gb(getattr(args, "pool", None), pool_dir)
     _check_disk_for_pool(pool_gb, pool_dir)  # reject a pool that won't fit on disk
-    fields: dict[str, object] = {}
-    if getattr(args, "vector_codec", None) is not None:
-        fields["vector_codec"] = args.vector_codec
-    if getattr(args, "codec_rank", None) is not None:
-        fields["codec_rank"] = int(args.codec_rank)
-    cfg = _write_config(pool_dir, pool_gb, **fields)  # raises PoolBudgetError if < floor
+    cfg = _write_config(pool_dir, pool_gb)  # raises PoolBudgetError if < floor
     reach = reach_tokens(cfg.pool_gb)
     print(f"initialized pool at {cfg.dir}")
     print(f"  pool size: {cfg.pool_gb} GB  (reach ~= {reach / 1e9:.2f}B tokens)")
-    print(f"  index: {cfg.index}   dim: {cfg.dim}   slice: {cfg.slice_tokens} tok"
-          f"   codec: {cfg.vector_codec}")
+    print(f"  index: {cfg.index}   dim: {cfg.dim}   slice: {cfg.slice_tokens} tok")
     free = free_disk_bytes(pool_dir)
     if free is not None:
         print(f"  disk: {free / BYTES_PER_GB:.1f} GB free at {pool_dir}")
@@ -339,7 +318,6 @@ def _cmd_resize(args: argparse.Namespace) -> int:
         pool_dir, int(args.pool),
         index=existing.index, dim=existing.dim, slice_tokens=existing.slice_tokens,
         mode=existing.mode,
-        vector_codec=existing.vector_codec, codec_rank=existing.codec_rank,
     )
     print(f"resized pool at {cfg.dir} to {cfg.pool_gb} GB "
           f"(reach ~= {reach_tokens(cfg.pool_gb) / 1e9:.2f}B tokens)")
@@ -400,20 +378,14 @@ def _build_session(args: argparse.Namespace) -> Session:
     working with no backend installed.
     """
     pool_dir = _resolve_dir(args.dir)
-    saved = PoolConfig.load(pool_dir)
-    pool_gb = args.pool if args.pool is not None else saved.pool_gb
-    # Codec flags fall back to the persisted config so `run`/`chat` honor a pool created with
-    # `init --vector-codec mpo`.
-    vector_codec = getattr(args, "vector_codec", None) or saved.vector_codec
-    codec_rank = getattr(args, "codec_rank", None) or saved.codec_rank
+    pool_gb = args.pool if args.pool is not None else PoolConfig.load(pool_dir).pool_gb
     return Session(
         model=args.model,
         pool_gb=int(pool_gb),
         pool_mode=args.pool_mode,
         pool_index=args.index,
         pool_dir=pool_dir,
-        vector_codec=vector_codec,
-        codec_rank=int(codec_rank),
+        mpo_chain=getattr(args, "mpo_chain", True),
         fallback_to_mock=True,
     )
 

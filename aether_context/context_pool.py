@@ -47,7 +47,6 @@ import numpy as np
 from aether_context._log import get_logger
 from aether_context.config import PoolConfig, TOKENS_PER_GB
 from aether_context.errors import PoolBudgetError, PoolCorrupt
-from aether_context.mpo import MpoCodec
 from aether_context.witness import Witness
 
 logger = get_logger(__name__)
@@ -68,12 +67,6 @@ POOL_FORMAT_VERSION: int = 1
 VECTORS_FILENAME: str = "vectors.f32"
 #: Sidecar metadata filename inside the pool dir.
 METADATA_FILENAME: str = "pool.json"
-#: Compressed vector store written when ``vector_codec="mpo"`` — the durable at-rest form of
-#: the vectors (tensor-train cores per row). When present and the raw ``vectors.f32`` is absent,
-#: the pool reconstructs the working mmap from it on open.
-COMPRESSED_VECTORS_FILENAME: str = "vectors.mpo.json"
-#: On-disk format version for the compressed vector sidecar.
-COMPRESSED_FORMAT_VERSION: int = 1
 #: Initial row capacity for a fresh vectors mmap (grown geometrically).
 _INITIAL_CAPACITY: int = 64
 
@@ -305,14 +298,6 @@ class ContextPool:
         # *renumbered* (eviction/compaction/load) so the HNSW graph must be rebuilt wholesale.
         self._index_dirty = False
         self._index_rebuild = True
-        # Optional MPO vector codec: when on, the durable on-disk vector store is tensor-train
-        # compressed (vectors.mpo.json) and reconstructed into the working mmap on load. The
-        # codec is a footprint optimization only — search always runs over the full mmap.
-        self._codec: MpoCodec | None = (
-            MpoCodec(self._dim, rank=config.codec_rank)
-            if config.vector_codec == "mpo"
-            else None
-        )
         # Restore from disk if a pool already exists in this dir.
         if self._metadata_file().exists():
             self._load()
@@ -320,9 +305,6 @@ class ContextPool:
     # -- paths -----------------------------------------------------------------
     def _vectors_file(self) -> Path:
         return self._dir / VECTORS_FILENAME
-
-    def _compressed_file(self) -> Path:
-        return self._dir / COMPRESSED_VECTORS_FILENAME
 
     def _metadata_file(self) -> Path:
         return self._dir / METADATA_FILENAME
@@ -539,10 +521,7 @@ class ContextPool:
         return len(self._slices) * slice_cost_bytes(self._dim)
 
     def stats(self) -> dict[str, Any]:
-        """A small dict snapshot: count, bytes, ceiling, dim, index kind, sessions, codec."""
-        codec = "mpo" if self._codec is not None else "none"
-        # Worst-case compression ratio of the on-disk vector store when the codec is on.
-        codec_ratio = self._codec.compression_ratio() if self._codec is not None else 1.0
+        """A small dict snapshot: count, bytes, ceiling, dim, index kind, sessions."""
         return {
             "count": len(self._slices),
             "bytes_used": self.bytes_used(),
@@ -550,8 +529,6 @@ class ContextPool:
             "dim": self._dim,
             "index": self.index_kind,
             "sessions": sorted({s.session for s in self._slices.values()}),
-            "vector_codec": codec,
-            "vector_codec_ratio": float(codec_ratio),
         }
 
     # -- persistence -----------------------------------------------------------
@@ -564,7 +541,6 @@ class ContextPool:
         """
         self._flush()
         self._release_mmap()
-        self._persist_compressed()
 
     def __del__(self) -> None:  # pragma: no cover - best-effort flush on GC
         try:
@@ -626,24 +602,13 @@ class ContextPool:
                 f"pool at {self._dir} was written with dim={disk_dim}, "
                 f"but this pool expects dim={self._dim}",
             )
-        self._capacity = max(capacity, _INITIAL_CAPACITY)
         vfile = self._vectors_file()
-        cfile = self._compressed_file()
-        if not vfile.exists() and cfile.exists():
-            # Durable form is the MPO-compressed store; reconstruct the working mmap from it.
-            if self._codec is None:
-                raise PoolCorrupt(
-                    f"pool at {self._dir} has a compressed vector store ({cfile.name}) but this "
-                    f"pool was opened with vector_codec='none'; reopen with vector_codec='mpo'."
-                )
-            matrix = self._reconstruct_compressed_matrix(cfile, self._capacity)
-            self._open_mmap(self._capacity, carry=matrix)
-        elif not vfile.exists():
+        if not vfile.exists():
             raise PoolCorrupt(
                 f"pool metadata at {path} present but vectors file {vfile} is missing"
             )
-        else:
-            self._open_mmap(self._capacity)
+        self._capacity = max(capacity, _INITIAL_CAPACITY)
+        self._open_mmap(self._capacity)
         assert self._mmap is not None
         try:
             for rec in records:
@@ -671,61 +636,6 @@ class ContextPool:
                 f"pool metadata at {path} has a malformed slice record: {exc}"
             ) from exc
         self._index_rebuild = True
-
-    # -- MPO vector codec (opt-in at-rest compression) -------------------------
-    def _persist_compressed(self) -> None:
-        """Write the tensor-train-compressed vector store and drop the raw mmap file.
-
-        No-op unless ``vector_codec="mpo"``. Encodes every live slice's stored unit vector into
-        a tensor train, writes them to ``vectors.mpo.json`` (the durable at-rest form), then
-        removes ``vectors.f32`` so the persisted footprint is the compressed store. Called from
-        :meth:`close` after the mmap is released. Fail-soft: a write error leaves the raw file
-        in place (still a valid, if larger, pool).
-        """
-        if self._codec is None or not self._order:
-            return
-        try:
-            rows = [
-                {"row": self._row_of[sid],
-                 "tt": MpoCodec.tt_to_lists(self._codec.encode(self._slices[sid].vector))}
-                for sid in self._order
-            ]
-            payload = {
-                "version": COMPRESSED_FORMAT_VERSION,
-                "codec": self._codec.to_dict(),
-                "rows": rows,
-            }
-            self._dir.mkdir(parents=True, exist_ok=True)
-            tmp = self._compressed_file().with_suffix(".json.tmp")
-            tmp.write_text(json.dumps(payload), encoding="utf-8")
-            os.replace(tmp, self._compressed_file())
-        except (OSError, ValueError) as exc:
-            logger.warning("compressed vector persist failed (%s); kept raw vectors", exc)
-            return
-        # Compressed store is the durable truth now; drop the raw working file.
-        try:
-            raw = self._vectors_file()
-            if raw.exists():
-                raw.unlink()
-        except OSError as exc:  # pragma: no cover - platform-dependent
-            logger.debug("could not remove raw vectors file (%s)", exc)
-
-    def _reconstruct_compressed_matrix(self, cfile: Path, capacity: int) -> np.ndarray:
-        """Rebuild the ``(capacity, dim)`` working matrix from a compressed sidecar (re-unit)."""
-        try:
-            data = json.loads(cfile.read_text(encoding="utf-8"))
-            codec = MpoCodec.from_dict(data["codec"])
-            mat = np.zeros((capacity, self._dim), dtype=np.float32)
-            for entry in data["rows"]:
-                row = int(entry["row"])
-                if 0 <= row < capacity:
-                    rec = codec.recover(MpoCodec.tt_from_lists(entry["tt"]))
-                    mat[row] = self._unit(rec)  # stored vectors are unit; re-normalize recon
-            return mat
-        except (json.JSONDecodeError, OSError, KeyError, TypeError, ValueError) as exc:
-            raise PoolCorrupt(
-                f"compressed vector store at {cfile} is malformed: {exc}"
-            ) from exc
 
     # -- mmap management -------------------------------------------------------
     def _ensure_capacity(self, n_rows: int) -> None:

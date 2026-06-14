@@ -23,7 +23,7 @@ Give your Ai superpowers with **Unlimited context for [Ollama](https://ollama.co
   <a href="#the-shape-of-it">The shape of it</a> ·
   <a href="#the-problem">Problem</a> ·
   <a href="#how-it-works">How it works</a> ·
-  <a href="#mpo-the-retrieval-layer">MPO retrieval</a> ·
+  <a href="#mpo-the-context-chain">MPO chain</a> ·
   <a href="#pick-your-memory-size">Memory size</a> ·
   <a href="#the-math-per-tier">The math</a> ·
   <a href="#ram-footprint">RAM</a> ·
@@ -74,27 +74,28 @@ It's **virtual memory, for attention.** Map it to an OS and it clicks:
 
 All of it runs while the model generates, so reaching the pool adds no wall-clock. → full explainer in [`docs/how-it-works.md`](docs/how-it-works.md).
 
-## MPO: the retrieval layer
+## MPO: the context chain
 
-Most long-context tools keep a big embedding index in memory and run a semantic search over it — and that resident index is exactly what caps how much you can hold.
+Plain semantic search returns isolated nearest-neighbors — the single closest slices, ripped out of the thread they belonged to. Recall a fact and you often miss the three slices around it that made it make sense.
 
-Unlimited Context does retrieval differently. Memory is stored and recovered with an **MPO (Matrix Product Operator) codec** — a *tensor-train* encode/recover. Each slice is factored into a compact tensor-train form on disk and reconstructed on demand, so the memory lives small at rest and only the working slice is rebuilt when the model reaches for it. **Encode to the pool, recover from it** — that's the retrieval, in place of a memory-bound semantic-search index.
+The **MPO (Matrix Product Operator) context chain** fixes that. It links the session's slices into one connected structure, so when cosine pulls an entry slice, the chain **pulls in the slices most coupled to it** — widening the working set with the *connected thread*, not stray hits. Cosine is still the retrieval mechanism; the MPO **assists** it.
 
-It's the lever behind the reach: you store far more per byte than a raw index, the pool reloads compact across sessions, and recovery is bounded (fidelity rises with the codec's rank). It is pure, deterministic linear algebra — numpy only, fully local.
+Coupling is ranked on two simple, session-local signals — **cost** and **time** (cache folds into cost): slices near each other in the session, at similar cost, that are also semantically related, are the ones pulled in together. It's deterministic, numpy-only linear algebra — no training, fully local, and purely additive (it only ever *adds* connected context; on any hiccup it falls back to plain cosine).
 
-```bash
-aether-context init --pool 10 --vector-codec mpo     # MPO-encoded pool
-```
+In a planted-thread benchmark, this lifts connected-context recall from **0.15 (cosine alone) to 0.78** — over 5× more of the right thread in the window. On by default:
+
 ```python
-Session(model="ollama/qwen2.5", pool_gb=10, vector_codec="mpo")
+Session(model="ollama/qwen2.5", pool_gb=10)                 # chain on by default
+Session(model="ollama/qwen2.5", pool_gb=10, mpo_chain=False) # plain cosine
 ```
-
-Opt-in today (`vector_codec="mpo"`); the default keeps raw vectors so existing pools are untouched.
+```bash
+aether-context run "..." --no-mpo-chain                      # disable for one run
+```
 
 ## What you get
 
 - 🧠 **Unbounded reach** — ~1B tokens of encoded context in ~5 GB on disk; the model reaches it in slices.
-- 🧩 **MPO retrieval** — memory is tensor-train encoded and recovered on demand, not held as a giant resident index.
+- 🧩 **MPO context chain** — recall pulls the whole connected thread, not isolated nearest-neighbors (5× connected-context recall in-bench).
 - ⚡ **Zero added latency** — the pager runs *concurrently* with generation, hidden behind the model's own thinking.
 - 🪟 **Curated beats crammed** — a small, relevant resident window outperforms a stuffed one (no lost-in-the-middle) — and costs less.
 - 🔒 **Local-first** — your context never leaves your machine. Free storage, full privacy, works offline.
@@ -204,7 +205,7 @@ RAM  ≈  ~180 MB   base (engine + shared static encoder)
 | Command | What it's for |
 |---|---|
 | `aether-context init` | Pick your pool size — the on-disk storage slider — on first run. |
-| `aether-context init --vector-codec mpo` | Same, but MPO-encode the pool's vectors (more reach per byte). |
+| `aether-context run "<task>" --no-mpo-chain` | Run with the MPO context chain disabled (plain cosine). |
 | `aether-context run "<task>"` | One-shot a task with full reach, then print the result. |
 | `aether-context chat` | Open an interactive session; type `/status` anytime, `/clear` to reset. |
 | `aether-context status` | See pool size, slices used, reach, and hit rate at a glance. |

@@ -7,13 +7,14 @@ All notable changes to `aether-context` are documented here. Format follows
 ## [Unreleased]
 
 ### Added
-- **MPO vector codec (opt-in).** `Session(vector_codec="mpo")` / `PoolConfig(vector_codec="mpo")`
-  compresses the pool's on-disk vector store with a tensor-train (Matrix Product Operator)
-  factorization — encode to compact cores on `close()`, reconstruct the working store on
-  `open()` — so a persistent pool holds more reach per byte. Numpy-only, deterministic,
-  lossy-but-bounded (fidelity rises with `codec_rank`); `status`/`stats` report the codec and
-  its compression ratio. Encode & recover only — it never ranks, scores, or gates slices.
-  Default `vector_codec="none"` is byte-identical to prior behavior.
+- **MPO context chain (on by default).** Links the session's slices into one connected
+  structure and assists retrieval: when cosine pulls an entry slice, the MPO (Matrix Product
+  Operator) chain pulls in the slices most coupled to it — widening the working set with the
+  *connected thread* instead of isolated nearest-neighbors. Coupling is ranked on two
+  session-local constants only, **cost and time** (cache folds into cost); cosine stays the
+  retrieval mechanism. Deterministic, numpy-only, fail-soft (degrades to plain cosine). In a
+  planted-thread bench, connected-context recall@8 rises 0.15 → 0.78. Disable with
+  `Session(mpo_chain=False)` / `--no-mpo-chain`.
 - `Witness` **temporal lock-in (anti-thrash)** — a freshly touched (just paged-in) slice carries
   a short-lived eviction bonus (`pin_periods` / `pin_bonus`) so the byte governor cannot evict it
   straight back to disk on the next turn, breaking the evict→cold-miss→re-page window flap. The

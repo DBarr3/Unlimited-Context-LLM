@@ -254,45 +254,62 @@ def test_runresult_stages_recorded(tmp_pool_dir):
         s.close()
 
 
-class TestMpoVectorCodec:
-    """Opt-in MPO vector codec: off-by-default, status surfacing, persistent reach reload."""
+class TestMpoChain:
+    """MPO context chain: on-by-default, status, and hit-expansion into connected context."""
 
-    def test_off_by_default(self, tmp_path):
-        from aether_context.context_pool import COMPRESSED_VECTORS_FILENAME
-        s = Session("mock", pool_gb=5, pool_dir=tmp_path)
-        assert s.status_dict()["vector_codec"] == "none"
-        s.remember("a durable fact the session will keep")
-        s.run("use the durable fact")
+    def test_on_by_default(self, tmp_pool_dir):
+        s = Session("mock", pool_gb=5, pool_dir=tmp_pool_dir)
+        assert s.chain is not None
+        assert s.status_dict()["mpo_chain"] is True
         s.close()
-        assert not (Path(tmp_path) / COMPRESSED_VECTORS_FILENAME).exists()
 
-    def test_codec_on_status_and_compressed_store(self, tmp_path):
-        from aether_context.context_pool import (
-            COMPRESSED_VECTORS_FILENAME,
-            VECTORS_FILENAME,
-        )
-        s = Session("mock", pool_gb=5, pool_dir=tmp_path, vector_codec="mpo")
-        st = s.status_dict()
-        assert st["vector_codec"] == "mpo"
-        assert st["vector_codec_ratio"] > 1.0
-        s.remember("first durable fact about the build plan")
-        s.remember("second durable fact about the api surface")
-        s.run("summarize the build plan and api surface")
+    def test_disabled_is_plain_cosine(self, tmp_pool_dir):
+        s = Session("mock", pool_gb=5, pool_dir=tmp_pool_dir, mpo_chain=False)
+        assert s.chain is None
+        assert s.status_dict()["mpo_chain"] is False
         s.close()
-        assert (Path(tmp_path) / COMPRESSED_VECTORS_FILENAME).exists()
-        assert not (Path(tmp_path) / VECTORS_FILENAME).exists()  # at-rest = compressed only
 
-    def test_persistent_pool_recovers_after_reopen(self, tmp_path):
-        s1 = Session("mock", pool_gb=5, pool_dir=tmp_path, vector_codec="mpo")
-        s1.remember("the deploy key lives in the vault, never in source")
-        s1.close()
-        # Reopen the persistent pool; vectors are recovered from the compressed store.
-        s2 = Session("mock", pool_gb=5, pool_dir=tmp_path, vector_codec="mpo")
-        hits = s2.recall("where does the deploy key live", k=1)
-        assert hits and "deploy key" in hits[0].text
-        s2.close()
+    def test_cold_retrieve_matches_cosine_when_off(self, tmp_pool_dir):
+        s = Session("mock", pool_gb=5, pool_dir=tmp_pool_dir, mpo_chain=False)
+        for i in range(6):
+            s.remember(f"distinct durable fact number {i} about subsystem {i}")
+        q = s.encoder.encode("subsystem 2 fact")
+        direct = [x.id for x in s.pool.search(q, 4, session=s._scope())]
+        via = [x.id for x in s._cold_retrieve(s._key(), q, 4)]
+        assert via == direct
+        s.close()
 
-    def test_invalid_codec_raises(self, tmp_path):
-        from aether_context.errors import AetherContextError
-        with pytest.raises(AetherContextError):
-            Session("mock", pool_gb=5, pool_dir=tmp_path, vector_codec="bogus")
+    def test_on_status_and_returns_k(self, tmp_pool_dir):
+        s = Session("mock", pool_gb=5, pool_dir=tmp_pool_dir, mpo_chain=True)
+        assert s.chain is not None
+        assert s.status_dict()["mpo_chain"] is True
+        for i in range(12):
+            s.remember(f"fact {i} about the auth subsystem and its tokens")
+        q = s.encoder.encode("auth subsystem tokens")
+        out = s._cold_retrieve(s._key(), q, 4)
+        assert len(out) == 4
+        s.close()
+
+    def test_chain_widens_with_connected_thread(self, tmp_pool_dir):
+        # A tight thread (near-identical text -> near-identical vectors, adjacent in time) plus
+        # unrelated distractors. The chain should pull a thread sibling in alongside the hit.
+        s = Session("mock", pool_gb=5, pool_dir=tmp_pool_dir, mpo_chain=True)
+        thread = [s.remember("the deploy pipeline builds signs and ships the installer")
+                  for _ in range(3)]
+        for i in range(8):
+            s.remember(f"unrelated note about topic {i} groceries weather sports")
+        q = s.encoder.encode("deploy pipeline builds signs ships installer")
+        out_ids = {x.id for x in s._cold_retrieve(s._key(), q, 4)}
+        thread_ids = {t.id for t in thread if t is not None}
+        assert len(out_ids & thread_ids) >= 2  # the connected thread is widened in
+        s.close()
+
+    def test_chain_failsoft(self, tmp_pool_dir, monkeypatch):
+        s = Session("mock", pool_gb=5, pool_dir=tmp_pool_dir, mpo_chain=True)
+        for i in range(8):
+            s.remember(f"fact {i} about the cache layer")
+        monkeypatch.setattr(s.chain, "expand", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
+        q = s.encoder.encode("cache layer")
+        out = s._cold_retrieve(s._key(), q, 4)
+        assert len(out) == 4  # degrades to cosine, no raise
+        s.close()
