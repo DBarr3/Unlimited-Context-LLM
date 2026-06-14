@@ -5,7 +5,6 @@
 from dataclasses import dataclass
 
 import numpy as np
-import pytest
 
 from aether_context.mpo import (
     ALPHA_DEFAULT,

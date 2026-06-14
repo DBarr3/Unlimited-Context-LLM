@@ -5,7 +5,6 @@
 import json
 
 import numpy as np
-import pytest
 
 from aether_context.context_pool import Slice
 from aether_context.encoder import ENCODER_VERSION
