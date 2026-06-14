@@ -28,6 +28,7 @@ Give your Ai superpowers with **Unlimited context for [Ollama](https://ollama.co
 
 <p align="center">
   <a href="#the-shape-of-it">The shape of it</a> ·
+  <a href="#the-proof">Proof</a> ·
   <a href="SAFETY.md">Safety</a> ·
   <a href="USE_POLICY.md">Use policy</a> ·
   <a href="#the-problem">Problem</a> ·
@@ -57,6 +58,57 @@ Four steps, start to reach:
 4. **Reach 1,000×+ further** — overflow is encoded to the pool and the exact slice is recovered the moment the model needs it.
 
 That's it. A 5 GB pool gives a small model ~1.16B tokens of reach — about **9,000×** a 128K window — on your own machine, offline.
+
+</div>
+
+---
+
+## The proof
+
+Not a synthetic micro-benchmark — a **real, paid, end-to-end run.** A reasoning model
+(`deepseek-v4-pro`) driven through a **40-turn agent session that overflows its window** (2,000-token
+window, 60 real `microsoft/vscode` issues), measured **engine off vs on**. One live run, **$0.185**,
+2026-06-14. Full writeup, per-turn data, and the exact reproduce command are committed:
+**[`docs/benchmarks/2026-06-14-deepseek-v4-pro-session-eval.md`](docs/benchmarks/2026-06-14-deepseek-v4-pro-session-eval.md)**.
+
+Three things it proved.
+
+**1. The model stops forgetting.** Recall of an early fact after it had fallen out of the window:
+
+```
+baseline (off)   ███░░░░░░░░░░░░░░░░░   0.15   drifts — forgets the early reads
+engine   (on)    ████████████████████   1.00   perfect recall, zero drift
+```
+
+**2. Failure turns into success on the actual work.** Tasks completed correctly:
+
+```
+baseline (off)   ███░░░░░░░░░░░░░░░░░   3 / 20
+engine   (on)    ████████████████████   20 / 20
+```
+
+**3. It's cheaper, not just better.** The engine sends a compact recalled slice instead of dragging
+the whole transcript forward each call:
+
+```
+total session cost          −24%
+back half (the recall phase) −54%
+```
+
+| arm | recall coherence | tasks correct | total cost | recall-phase $/turn |
+|---|:---:|:---:|:---:|:---:|
+| **off** — baseline (no engine) | 0.15 | 3 / 20 | $0.0711 | $0.00117 |
+| **on** — engine | **1.00** | **20 / 20** | **$0.0542** | **$0.00053** |
+
+<sub>Single live run — `deepseek-v4-pro` via OpenRouter, 2,000-token window, 40 turns (20 read → 20
+recall), 60 `microsoft/vscode` issues, supervised under a $25 hard cap. The win lands in the back
+half: once early reads fall out of the window, the baseline forgets and the engine doesn't. Data,
+methodology, and `python -m bench.api_eval …` reproduce command in the
+[benchmark writeup](docs/benchmarks/2026-06-14-deepseek-v4-pro-session-eval.md).</sub>
+
+---
+
+<div align="center">
 
 ## The problem
 
@@ -91,7 +143,7 @@ The **MPO context chain** fixes that. It links the session's slices into one con
 
 The chain is **Aether-tuned, deterministic, and fully local** — no training, no network. It's purely **additive**: it only ever *adds* connected context, never blocks or replaces a hit, and on any hiccup it falls back cleanly to plain cosine.
 
-In a planted-thread benchmark, this lifts connected-context recall from **0.15 (cosine alone) to 0.78** — over 5× more of the right thread in the window. On by default:
+In a planted-thread benchmark, this lifts *connected-context* recall from **0.15 (cosine alone) to 0.78** — over 5× more of the right thread in the window. (This is the chain's own metric — multi-slice thread recall — separate from the engine's single-fact recall in [The proof](#the-proof) above.) On by default:
 
 ```python
 Session(model="ollama/qwen2.5", pool_gb=10)                 # chain on by default
