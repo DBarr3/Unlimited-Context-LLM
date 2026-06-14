@@ -50,13 +50,13 @@ def main() -> int:
         for j in range(THREAD_SIZE):
             text = topic + " " + " ".join(rng.choice(topic.split(), size=3))
             cid = f"t{ti}_{j}"
-            items.append(ChainItem(cid, enc.encode(text), cost=float(len(text.split())), time=t))
+            items.append(ChainItem(cid, enc.encode(text), c_t=(t, float(len(text.split())))))
             ids.append(cid)
             t += 1.0
         threads.append(ids)
     for d in range(DISTRACTORS):
         text = " ".join(rng.choice(_NOISE, size=6))
-        items.append(ChainItem(f"d{d}", enc.encode(text), cost=float(len(text.split())), time=t))
+        items.append(ChainItem(f"d{d}", enc.encode(text), c_t=(t, float(len(text.split())))))
         t += 1.0
 
     by_id = {it.id: it for it in items}

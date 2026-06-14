@@ -80,7 +80,7 @@ Plain semantic search returns isolated nearest-neighbors — the single closest 
 
 The **MPO (Matrix Product Operator) context chain** fixes that. It links the session's slices into one connected structure, so when cosine pulls an entry slice, the chain **pulls in the slices most coupled to it** — widening the working set with the *connected thread*, not stray hits. Cosine is still the retrieval mechanism; the MPO **assists** it.
 
-Coupling is ranked on two simple, session-local signals — **cost** and **time** (cache folds into cost): slices near each other in the session, at similar cost, that are also semantically related, are the ones pulled in together. It's deterministic, numpy-only linear algebra — no training, fully local, and purely additive (it only ever *adds* connected context; on any hiccup it falls back to plain cosine).
+A compact operator (`c_t`) scores which candidates belong to the same thread as the hit, so the slices pulled in are genuinely connected — not just lexically nearest. It's deterministic, numpy-only linear algebra — no training, fully local, and purely additive (it only ever *adds* connected context; on any hiccup it falls back to plain cosine).
 
 In a planted-thread benchmark, this lifts connected-context recall from **0.15 (cosine alone) to 0.78** — over 5× more of the right thread in the window. On by default:
 

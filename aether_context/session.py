@@ -317,8 +317,8 @@ class Session:
         """Pager cold path honoring the session's pool mode (shared -> global search).
 
         With ``mpo_chain`` enabled, cosine still selects the entry hits; the MPO chain then
-        widens the window with the slices most coupled to them on (cost, time) — connected
-        context. Fail-soft: any chain error returns the plain cosine ``slices[:k]``.
+        widens the window with the slices most coupled to them — connected context. Fail-soft:
+        any chain error returns the plain cosine ``slices[:k]``.
         """
         scope = self._scope()
         if self.chain is None:
@@ -327,15 +327,12 @@ class Session:
         if len(candidates) <= k:
             return candidates[:k]
         try:
-            cached = {sl.id for sl in self.pager.window()}  # resident slices = cheaper to chain
+            warm = {sl.id for sl in self.pager.window()}
             items = [
-                ChainItem(
-                    id=sl.id, vector=sl.vector, cost=float(sl.tokens),
-                    time=float(sl.meta.get("t", 0.0)), cached=sl.id in cached,
-                )
+                ChainItem(id=sl.id, vector=sl.vector, c_t=self._c_t(sl, warm))
                 for sl in candidates
             ]
-            seed = [sl.id for sl in candidates[: min(2, k)]]  # top cosine hits seed the chain
+            seed = [sl.id for sl in candidates[: min(2, k)]]
             order = self.chain.expand(seed, items, width=k)
             by_id = {sl.id: sl for sl in candidates}
             widened = [by_id[i] for i in order if i in by_id]
@@ -343,6 +340,11 @@ class Session:
         except Exception as exc:  # noqa: BLE001 - fail-soft: chain only ever augments
             logger.warning("MPO chain expand failed (%s); serving cosine order", exc)
             return candidates[:k]
+
+    @staticmethod
+    def _c_t(sl: Slice, warm: set[str]) -> tuple[float, float]:
+        """The chain coordinate for a slice."""
+        return (float(sl.meta.get("_ct", 0.0)), float(sl.tokens) / (2.0 if sl.id in warm else 1.0))
 
     # -- plant / recover a fact -----------------------------------------------
     def remember(self, text: str, *, tags: dict[str, Any] | None = None) -> Slice | None:
@@ -404,10 +406,9 @@ class Session:
         sid = f"{self.id}:slice:{self._spill_seq}"
         tokens = self._count_tokens(text)
         score = self._salience(text, salience)
-        # Stamp the slice's session position ("time" constant) for the MPO chain, unless the
-        # caller already supplied one. Monotonic per encode, so adjacency = same line of work.
+        # Chain coordinate component for this slice (monotonic per encode).
         meta = dict(tags)
-        meta.setdefault("t", float(self._spill_seq))
+        meta.setdefault("_ct", float(self._spill_seq))
         sl = Slice(
             id=sid, session=self.id, vector=np.asarray(vec, dtype=np.float32),
             text=text, tokens=int(tokens), meta=meta, score=score,
