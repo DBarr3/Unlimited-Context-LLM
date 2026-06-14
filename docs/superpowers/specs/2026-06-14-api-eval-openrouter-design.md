@@ -6,95 +6,105 @@
 
 ## 1. Summary
 
-Prove the engine works on a real hosted model (not local): a vendor-neutral OpenAI-compatible
-backend plus a paid/manual eval bench that runs against OpenRouter. The eval proves two things
-on a real **reasoning** model:
+A simple, autonomous test harness that proves the engine on a real hosted reasoning model
+(DeepSeek via OpenRouter). A lean agent loop works through 50–100 real GitHub issues using
+tools; the harness measures, across the whole session: **cost, efficiency, tools called
+(incl. redundant), coherence, and the gain** from the engine + MPO chain.
 
-1. **Recovery** — with the engine on, an early load-bearing fact stays reachable across a run
-   that overflows the model's window; without it, the fact is lost.
-2. **Chain A/B** — the MPO context chain (on vs off) lifts connected-context retrieval.
+Pure OpenRouter — no AETHER-CLOUD, no aether infra. Hand over a burner `OPENROUTER_API_KEY`
+and it runs end-to-end with no intervention.
 
-Scored two ways: **needle** (deterministic exact-match) and an **LLM-judge** (coherence 1–10).
-Pure OpenRouter — no AETHER-CLOUD, no aether infra. The adapter is a genuine OSS feature.
+Keep-it-simple budget: **one adapter + one bench file + their unit tests.** No reuse of the
+full headless brain/kernel/protocol — a tiny purpose-built loop in the bench is simpler and
+fully controlled.
 
 ## 2. Goals / Non-Goals
 
 ### Goals
-- A vendor-neutral `OpenAICompatLLM` backend (`openai/<model>` spec) — works with any
-  OpenAI-compatible API (OpenRouter, OpenAI, vLLM, …). stdlib `urllib` only, no new dependency.
-- A `bench/api_eval.py` harness measuring recovery (ON/OFF) + chain (on/off), needle + judge.
-- Default to a **cheap reasoning model** (DeepSeek-class), overridable via `--model`.
-- Key from env (`OPENROUTER_API_KEY`); never committed/logged. Bench skips cleanly with no key.
+- Vendor-neutral `OpenAICompatLLM` (`openai/<model>` spec) — any OpenAI-compatible API. stdlib
+  `urllib`, no new dependency. Used for both Session streaming and the loop's tool-calling chat.
+- A lean agent loop (in the bench) with 2 synthetic tools over the fetched issues; counts tool
+  calls and **redundant** tool calls.
+- Measure over the session: cost ($), efficiency (tokens/latency), tools called + redundant,
+  coherence per turn, and ON-vs-OFF gain.
+- Autonomous: `OPENROUTER_API_KEY` + `--model`; default a cheap DeepSeek reasoning slug.
 
 ### Non-Goals
-- No AETHER-CLOUD endpoint, no aether infra, no private namespaces (moat-seal guard must pass).
-- Not in the CI matrix (it costs money + needs a key). CI only covers the adapter's unit tests
-  (mocked HTTP, no network).
+- No AETHER-CLOUD / aether infra / private namespaces (moat-seal guard must pass).
+- Not in the CI matrix (paid + needs a key). CI runs the adapter unit tests (mocked HTTP) and
+  the bench `--dry-run` (MockLLM) only.
+- No real filesystem/tool execution — tools return synthetic results from the issue data.
 - No new runtime dependency.
 
-## 3. Adapter — `OpenAICompatLLM`
+## 3. Adapter — `OpenAICompatLLM` (`aether_context/local_llm.py`)
 
-In `aether_context/local_llm.py`, implementing the `LocalLLM` protocol.
+Implements the `LocalLLM` protocol; one place for OpenRouter HTTP.
 
-- **Spec:** `openai/<model>` → `OpenAICompatLLM(ref, base_url=…, api_key=…, context_window=…)`.
-  Added to `parse_spec` (`openai` backend) and `load_model`.
-- **Config resolution:** `base_url`/`api_key` from kwargs, else env. If `OPENROUTER_API_KEY`
-  is set and no base_url given, default `base_url=https://openrouter.ai/api/v1`. Generic
-  fallback: `OPENAI_BASE_URL` / `OPENAI_API_KEY`.
-- **`generate`** — POST `<base_url>/chat/completions` with `stream: true`; parse SSE lines
-  (`data: {json}`, terminated by `data: [DONE]`); yield `choices[0].delta.content`. A
-  reasoning model's separate `delta.reasoning` field is **ignored** (we page the final answer,
-  not the scratchpad). `system`/`stop`/`max_tokens` forwarded as the OpenAI params.
-- **`context_window`** — caller-provided (no generic probe). The eval sets it **small** to
-  force overflow. Default fallback `DEFAULT_CONTEXT_WINDOW`.
-- **`count_tokens`** — chars/4 estimate (no count endpoint).
-- **Errors** — typed/hinted (`BackendUnavailable` on missing key / network; map HTTP 401/429/
-  5xx). Key never appears in logs or error text.
+- **Spec** `openai/<model>` → `OpenAICompatLLM(ref, base_url=…, api_key=…, context_window=…)`;
+  wired into `parse_spec` + `load_model`.
+- **Config:** kwargs else env. `OPENROUTER_API_KEY` set + no base_url ⇒ default
+  `https://openrouter.ai/api/v1`. Generic fallback `OPENAI_BASE_URL`/`OPENAI_API_KEY`.
+- **`generate`** (LocalLLM, streaming) — POST `chat/completions` `stream:true`; yield
+  `choices[0].delta.content`; reasoning `delta.reasoning` ignored. For the Session arms.
+- **`chat(messages, tools)`** (bench helper, non-stream) — POST `chat/completions` with
+  `tools`; return `{content, tool_calls, usage}` (real prompt/completion token counts from the
+  API `usage` field — drives the cost metric). For the agent-loop arms.
+- **`context_window`** caller-provided (eval forces it small); **`count_tokens`** chars/4.
+- **Errors** typed/hinted (401/429/5xx → `BackendUnavailable`); key never logged.
 
-## 4. Eval harness — `bench/api_eval.py`
+## 4. The harness — `bench/api_eval.py`
 
-Manual/paid bench (sibling of `drift_vs_window.py`). **No key → print a skip notice and exit 0.**
+Autonomous, paid. **No key ⇒ print skip + exit 0.** Flags: `--model`, `--repo` (default a big
+public repo), `--issues` (50–100), `--turns`, `--window` (small, force overflow), `--arms`,
+`--max-calls` (hard cap), `--dry-run`.
 
-Common: `Session(model="openai/<m>", context_window=W, pool_dir=<tmp>)` with a small `W`
-(default ~2048) so the run overflows into the pool. Flags: `--model`, `--trials`, `--window`,
-`--max-calls` (hard cap), `--judge/--no-judge`, `--dry-run`.
+### 4.1 Corpus
+Fetch issues via GitHub REST (stdlib urllib, unauthenticated, `per_page=100`), cache to
+`bench/.cache/issues-<owner>-<repo>.json`. Each issue's real fields (number, title, body,
+labels) are ground truth.
 
-### 4.1 Recovery (engine ON vs OFF), N≈20 trials
-- Plant a unique needle early (`s.remember("the vault code is ZORN-7741")`, needle randomized
-  per trial by index — no `Math.random`; seed from trial number).
-- Drive a long body of filler that overflows `W` several times, then ask: "What is the vault code?"
-- **ON** = `Session.run` (engine pages the needle back). **OFF** = a direct
-  `OpenAICompatLLM.generate` call with the transcript truncated to `W` (no pool — the needle
-  has fallen off). Same model, same window.
-- **Score:** exact-match — does the answer contain the needle? → recovery rate ON vs OFF.
+### 4.2 Tools (synthetic, from the corpus)
+- `search_issues(query)` → list of `{number, title}` whose title/labels match.
+- `lookup_issue(number)` → that issue's body + labels.
+The harness answers these from the cached data and records each call.
 
-### 4.2 Chain A/B (chain on vs off), N≈20 trials
-- Plant a thread of ~5 linked needles spread across the session (e.g. steps of one procedure),
-  plus unrelated filler. Ask a question that needs several thread members.
-- Two engine-ON sessions differing only in `mpo_chain` (True/False).
-- **Score:** thread-recall — how many of the thread needles appear in the recovered working set
-  (and in the answer) → on vs off.
+### 4.3 Agent loop (lean, in the bench)
+A task that forces the model to revisit earlier issues (e.g. "triage these issues: group by
+component, then for each early issue confirm its label" — the early ones overflow the window).
+Per turn: call `adapter.chat(messages, tools)`; if it returns tool_calls → answer them
+(synthetic), append, continue; else it's the answer → score. Cap by `--turns` / `--max-calls`.
 
-### 4.3 Judge pass (when `--judge`)
-- A judge model (OpenRouter, `--judge-model`, default a cheap instruct model) scores each
-  ON/OFF answer 1–10 for coherence + completeness against the expected facts. Report mean
-  on vs off for both tests.
+**Engine integration / arms:**
+- **OFF** — no engine: messages = full growing transcript **truncated to `--window`** (early
+  issues fall off → the model must re-`lookup_issue` them).
+- **ON+CHAIN** (default on) — tool results + turns are encoded into a `Session` pool; each
+  turn's prompt is built from the engine's recalled working set (chain-expanded) instead of the
+  full transcript, so earlier issues stay reachable without re-fetching.
+- Optional middle arm **ON** (`--arms off,on,on_chain`) — engine, chain off — to isolate the
+  chain's marginal value.
 
-## 5. Output / cost / safety
-- Prints a table: recovery rate ON/OFF; chain thread-recall on/off; judge means. Writes
-  `api_eval_results.json` (**gitignored**) with per-trial detail + model + counts + est. cost.
-- `--max-calls` hard-caps total API calls; the harness refuses to exceed it.
-- Key from env only; results file gitignored; no aether endpoints.
+### 4.4 Metrics (per turn + session aggregate, per arm)
+- **Cost** — prompt+completion tokens from API `usage` → $ via a `--price-in/--price-out`
+  (per-1M) flag. OFF balloons each turn; ON stays flat → Δ$ = the headline.
+- **Tools called** — total, and **redundant** (same `lookup_issue(n)` issued more than once =
+  the model forgot). The engine should cut redundancy.
+- **Coherence** — per turn: does the answer use the correct issue fields (exact-match against
+  ground truth)? Plotted vs turn index → drift curve.
+- **Efficiency** — tokens/turn, latency/turn, turns-to-done.
+- **Gained** — ON / ON+CHAIN vs OFF deltas on all the above.
 
-## 6. Testing
-- `tests/test_local_llm_openai.py` (CI, mocked HTTP, **no network**): spec parsing
-  `openai/<model>`; SSE stream parse → chunks; `[DONE]` handling; reasoning-delta ignored;
-  error mapping (401/429/5xx → typed); env resolution (OpenRouter default base_url);
-  `count_tokens` estimate.
-- `bench/api_eval.py --dry-run` uses `MockLLM` so the harness logic (needle plant, overflow,
-  scoring, table) is exercised with no key/network; CI can run the dry-run.
+### 4.5 Output / safety
+Prints a table (per arm: cost, tools, redundant, coherence, latency) + writes
+`api_eval_results.json` (**gitignored**) with per-turn detail + model + counts + est. cost.
+`--max-calls` hard-caps spend. Key from env only.
 
-## 7. Reversibility
-Pure addition: one new backend in `local_llm.py` (+ spec wiring), one new bench, one new test.
-Default behavior unchanged. The moat-seal guard scans the additions and must stay green
-(vendor-neutral, no private namespaces).
+## 5. Testing
+- `tests/test_local_llm_openai.py` (CI, mocked HTTP, no network): spec parse; streaming parse +
+  `[DONE]`; reasoning-delta ignored; `chat` tool_calls parse + usage; error mapping; env
+  base_url resolution; `count_tokens`.
+- `bench/api_eval.py --dry-run` (MockLLM + a scripted tool-calling mock): exercises fetch-cache
+  parse, the loop, tool counting, scoring, and the table — no key/network. CI runs the dry-run.
+
+## 6. Reversibility
+Pure addition: one backend (+spec wiring), one bench, one test. Default engine behavior
+unchanged. moat-seal guard scans the additions and stays green (vendor-neutral).
