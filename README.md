@@ -16,15 +16,15 @@ Give your Ai superpowers with **Unlimited context for [Ollama](https://ollama.co
 
 <div align="center">
 
-> **Your context window didn't get bigger. Its *reach* became unbounded.**
-> Unlimited Context is virtual memory for an LLM's attention — a small, fast resident window over a vast local store, paged in and out *while the model reasons*. So an 8B model on your laptop stays coherent across a build that would blow past any context window on earth.
+> **Your context window didn't get bigger. Its *reach* did.**
+> Unlimited Context is virtual memory for an LLM. The model keeps its small window; the engine keeps a vast store on your disk and pulls the *right slice* back in while the model reasons. A small local model stays coherent across runs that would blow past any context window.
 
 <p align="center">
-  <a href="#the-problem-everyone-hits">Problem</a> ·
-  <a href="#how-it-works-60-seconds">How it works</a> ·
-  <a href="#pick-your-memory-size">Pick your memory size</a> ·
-  <a href="#what-that-buys-you-in-coding-time">Coding time</a> ·
-  <a href="#running-many-sessions">Many sessions</a> ·
+  <a href="#the-shape-of-it">The shape of it</a> ·
+  <a href="#the-problem">Problem</a> ·
+  <a href="#how-it-works">How it works</a> ·
+  <a href="#mpo-the-retrieval-layer">MPO retrieval</a> ·
+  <a href="#pick-your-memory-size">Memory size</a> ·
   <a href="#the-math-per-tier">The math</a> ·
   <a href="#ram-footprint">RAM</a> ·
   <a href="#common-commands">Commands</a> ·
@@ -38,13 +38,22 @@ Give your Ai superpowers with **Unlimited context for [Ollama](https://ollama.co
 
 <div align="center">
 
-## The problem everyone hits
+## The shape of it
 
-Long agentic runs all die the same way. The model fills its window, starts **compressing** its own history, silently drops the one detail that mattered three steps ago — and drifts. You've seen it: the runaway PR, the agent that confidently rewrites a function it already wrote, the build that falls apart at hour two. Bigger windows just delay it, and a crammed 1M-token window **rots in the middle** anyway.
+Four steps, start to reach:
 
-## The fix: don't compress the overflow — *encode* it
+1. **Pick a model** — any local model (Ollama, llama.cpp, Hugging Face) or your own API-backed one.
+2. **Start a session** — one object wraps the model and its memory.
+3. **Allocate disk** — choose a pool size; that disk *is* the memory.
+4. **Reach 1,000×+ further** — overflow is encoded to the pool and the exact slice is recovered the moment the model needs it.
 
-Unlimited Context fixes the overflow, not the window. Instead of blindly summarizing what spills over, it **encodes and externalizes** it to a local pool on your disk, and pages the *right slice* back in exactly when the model needs it. Nothing load-bearing is silently lost — it's filed, and recoverable.
+That's it. A 5 GB pool gives a small model ~1.16B tokens of reach — about **9,000×** a 128K window — on your own machine, offline.
+
+## The problem
+
+Long agentic runs all die the same way. The model fills its window, starts **compressing** its own history, silently drops the one detail that mattered three steps ago — and drifts. You've seen it: the runaway PR, the agent that rewrites a function it already wrote, the build that falls apart at hour two. Bigger windows just delay it, and a crammed 1M-token window **rots in the middle** anyway.
+
+The fix isn't a bigger window — it's to stop throwing the overflow away. Instead of summarizing what spills over, Unlimited Context **encodes** it to a local pool on your disk and **recovers** the right slice exactly when it's needed. Nothing load-bearing is silently lost.
 
 <p align="center"><strong>Compress &amp; forget ✗ &nbsp;→&nbsp; Encode &amp; recover ✓</strong></p>
 
@@ -52,26 +61,44 @@ Unlimited Context fixes the overflow, not the window. Instead of blindly summari
   <img width="880" alt="Compress and forget vs encode and recover" src="https://github.com/user-attachments/assets/dadae038-5e1a-45c6-b16c-4763da4238a8" />
 </div>
 
-## How it works (60 seconds)
+## How it works
 
 It's **virtual memory, for attention.** Map it to an OS and it clicks:
 
 | OS | Unlimited Context |
 |---|---|
 | RAM | the **resident window** the model sees now (small, fast) |
-| Disk | the **context pool** (~5 GB, ~1B tokens, encoded) |
+| Disk | the **context pool** — your encoded memory (~5 GB ≈ ~1B tokens) |
 | Pager | the **slice loader** — prefetches the next slice from what the model is reasoning about *right now* |
-| Page-replacement | the **witnesses (+/−)** — salient slices *harden*, stale ones *fade*, anything relevant again *re-hardens* |
+| Page-replacement | the **witnesses (+/−)** — useful slices *stay*, stale ones *fade*, anything relevant again comes back |
 
-All of it runs while the model generates, so reaching the pool costs you no extra wall-clock. → full explainer in [`docs/how-it-works.md`](docs/how-it-works.md).
+All of it runs while the model generates, so reaching the pool adds no wall-clock. → full explainer in [`docs/how-it-works.md`](docs/how-it-works.md).
+
+## MPO: the retrieval layer
+
+Most long-context tools keep a big embedding index in memory and run a semantic search over it — and that resident index is exactly what caps how much you can hold.
+
+Unlimited Context does retrieval differently. Memory is stored and recovered with an **MPO (Matrix Product Operator) codec** — a *tensor-train* encode/recover. Each slice is factored into a compact tensor-train form on disk and reconstructed on demand, so the memory lives small at rest and only the working slice is rebuilt when the model reaches for it. **Encode to the pool, recover from it** — that's the retrieval, in place of a memory-bound semantic-search index.
+
+It's the lever behind the reach: you store far more per byte than a raw index, the pool reloads compact across sessions, and recovery is bounded (fidelity rises with the codec's rank). It is pure, deterministic linear algebra — numpy only, fully local.
+
+```bash
+aether-context init --pool 10 --vector-codec mpo     # MPO-encoded pool
+```
+```python
+Session(model="ollama/qwen2.5", pool_gb=10, vector_codec="mpo")
+```
+
+Opt-in today (`vector_codec="mpo"`); the default keeps raw vectors so existing pools are untouched.
 
 ## What you get
 
 - 🧠 **Unbounded reach** — ~1B tokens of encoded context in ~5 GB on disk; the model reaches it in slices.
-- ⚡ **Zero added latency** — the pager runs *concurrently* with generation, hidden behind the model's own thinking, so reaching the pool costs you no extra wall-clock.
+- 🧩 **MPO retrieval** — memory is tensor-train encoded and recovered on demand, not held as a giant resident index.
+- ⚡ **Zero added latency** — the pager runs *concurrently* with generation, hidden behind the model's own thinking.
 - 🪟 **Curated beats crammed** — a small, relevant resident window outperforms a stuffed one (no lost-in-the-middle) — and costs less.
 - 🔒 **Local-first** — your context never leaves your machine. Free storage, full privacy, works offline.
-- 🤖 **Any model** — Llama, Qwen, Mistral, Phi — via Ollama, llama.cpp, or HF. Bring your own brain.
+- 🤖 **Any model** — Llama, Qwen, Mistral, Phi — via Ollama, llama.cpp, or HF, or your own API-backed model.
 - 📉 **Coherence you can *measure*** — ship the head-to-head: same model, engine on vs off, watch the drift rate fall off a cliff.
 
 ## Pick your memory size
@@ -177,6 +204,7 @@ RAM  ≈  ~180 MB   base (engine + shared static encoder)
 | Command | What it's for |
 |---|---|
 | `aether-context init` | Pick your pool size — the on-disk storage slider — on first run. |
+| `aether-context init --vector-codec mpo` | Same, but MPO-encode the pool's vectors (more reach per byte). |
 | `aether-context run "<task>"` | One-shot a task with full reach, then print the result. |
 | `aether-context chat` | Open an interactive session; type `/status` anytime, `/clear` to reset. |
 | `aether-context status` | See pool size, slices used, reach, and hit rate at a glance. |

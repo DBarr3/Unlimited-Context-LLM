@@ -88,7 +88,7 @@ def _call_args(call: dict[str, Any]) -> tuple[str, str, dict[str, Any], bool]:
     `malformed` is True when the model emitted a non-empty arguments string that
     is not valid JSON — the small-model failure signature. We still coerce args
     to {} and proceed (so a single bad call doesn't kill the run), but the marker
-    is surfaced so a long run's emission quality is measurable (the kill-gate /
+    is surfaced so a long run's emission quality is measurable (the benchmark /
     stress test buckets these by session position)."""
     fn = call.get("function", {})
     name = fn.get("name", "")
