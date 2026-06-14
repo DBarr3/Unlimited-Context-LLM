@@ -21,9 +21,10 @@ Give your Ai superpowers with **Unlimited context for [Ollama](https://ollama.co
 
 > ⚠️ **Giving a model durable memory is powerful — read the safety measures first.** Real
 > concerns (runaway agents, grounding drift, an agent's own notes becoming its rules) and what
-> we do about them: **[Aether AI — Ethical & Safety Measures](SAFETY.md)**. The terms the project
-> is released under — open under Apache-2.0, with a short acceptable-use policy:
-> **[Acceptable Use Policy](USE_POLICY.md)**.
+> we do about them: **[Aether AI — Ethical & Safety Measures](SAFETY.md)**. The project is open
+> under Apache-2.0 and governed by the **[Acceptable Use Policy](USE_POLICY.md)** — these are not
+> recommendations. Anyone using the project must comply with its terms, and by using the project you
+> already agree to and are bound by them.
 
 <p align="center">
   <a href="#the-shape-of-it">The shape of it</a> ·
@@ -252,7 +253,7 @@ If Unlimited Context helps your work, please cite it. Built and maintained by **
   author       = {Barrante, Brandon},
   organization = {Aether AI},
   year         = {2026},
-  url          = {https://github.com/DBarr3/Unlimited-Context},
+  url          = {https://github.com/DBarr3/Unlimited-Context-LLM},
   license      = {Apache-2.0}
 }
 ```
