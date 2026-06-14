@@ -19,7 +19,6 @@ Style mirrors the package's own ``test_slice_loader.py``.
 """
 from __future__ import annotations
 
-import json
 import time
 from pathlib import Path
 
@@ -255,50 +254,45 @@ def test_runresult_stages_recorded(tmp_pool_dir):
         s.close()
 
 
-class TestMpoRerank:
-    """Opt-in MPO re-rank bolt-on: off-by-default parity, persistence, validation."""
+class TestMpoVectorCodec:
+    """Opt-in MPO vector codec: off-by-default, status surfacing, persistent reach reload."""
 
-    def test_off_by_default_writes_no_sidecar(self, tmp_path):
+    def test_off_by_default(self, tmp_path):
+        from aether_context.context_pool import COMPRESSED_VECTORS_FILENAME
         s = Session("mock", pool_gb=5, pool_dir=tmp_path)
-        assert s.status_dict()["rerank"] == "off"
-        s.run("hello world build something")
+        assert s.status_dict()["vector_codec"] == "none"
+        s.remember("a durable fact the session will keep")
+        s.run("use the durable fact")
         s.close()
-        assert not (Path(tmp_path) / "mpo.json").exists()
+        assert not (Path(tmp_path) / COMPRESSED_VECTORS_FILENAME).exists()
 
-    def test_off_cold_retrieve_matches_pool_search(self, tmp_path):
-        s = Session("mock", pool_gb=5, pool_dir=tmp_path)
-        s.remember("the database password is in vault")
-        s.remember("the api runs on port 8080")
-        q = s.encoder.encode("database vault")
-        key = s._key()
-        direct = s.pool.search(q, 8, session=s._scope())
-        via = s._cold_retrieve(key, q, 8)
-        assert [x.id for x in via] == [x.id for x in direct]
+    def test_codec_on_status_and_compressed_store(self, tmp_path):
+        from aether_context.context_pool import (
+            COMPRESSED_VECTORS_FILENAME,
+            VECTORS_FILENAME,
+        )
+        s = Session("mock", pool_gb=5, pool_dir=tmp_path, vector_codec="mpo")
+        st = s.status_dict()
+        assert st["vector_codec"] == "mpo"
+        assert st["vector_codec_ratio"] > 1.0
+        s.remember("first durable fact about the build plan")
+        s.remember("second durable fact about the api surface")
+        s.run("summarize the build plan and api surface")
         s.close()
+        assert (Path(tmp_path) / COMPRESSED_VECTORS_FILENAME).exists()
+        assert not (Path(tmp_path) / VECTORS_FILENAME).exists()  # at-rest = compressed only
 
-    def test_mpo_mode_writes_sidecar_on_close(self, tmp_path):
-        s = Session("mock", pool_gb=5, pool_dir=tmp_path, rerank="mpo")
-        assert s.status_dict()["rerank"] == "mpo"
-        s.remember("load-bearing fact one about auth tokens")
-        s.remember("load-bearing fact two about rate limits")
-        s.run("explain the auth tokens and rate limits")
-        s.close()
-        assert (Path(tmp_path) / "mpo.json").exists()
-
-    def test_mpo_mode_reopen_loads_operator(self, tmp_path):
-        s1 = Session("mock", pool_gb=5, pool_dir=tmp_path, rerank="mpo")
-        s1.remember("fact alpha for training the operator")
-        s1.remember("fact beta for training the operator")
-        s1.run("use fact alpha and fact beta")
+    def test_persistent_pool_recovers_after_reopen(self, tmp_path):
+        s1 = Session("mock", pool_gb=5, pool_dir=tmp_path, vector_codec="mpo")
+        s1.remember("the deploy key lives in the vault, never in source")
         s1.close()
-        data = json.loads((Path(tmp_path) / "mpo.json").read_text(encoding="utf-8"))
-        updates1 = data["core"]["n_updates"]
-        assert updates1 > 0
-        s2 = Session("mock", pool_gb=5, pool_dir=tmp_path, rerank="mpo")
-        assert s2.status_dict()["mpo_updates"] == updates1
+        # Reopen the persistent pool; vectors are recovered from the compressed store.
+        s2 = Session("mock", pool_gb=5, pool_dir=tmp_path, vector_codec="mpo")
+        hits = s2.recall("where does the deploy key live", k=1)
+        assert hits and "deploy key" in hits[0].text
         s2.close()
 
-    def test_invalid_rerank_raises(self, tmp_path):
+    def test_invalid_codec_raises(self, tmp_path):
         from aether_context.errors import AetherContextError
         with pytest.raises(AetherContextError):
-            Session("mock", pool_gb=5, pool_dir=tmp_path, rerank="bogus")
+            Session("mock", pool_gb=5, pool_dir=tmp_path, vector_codec="bogus")

@@ -144,7 +144,7 @@ def run_brain(
     # SELF-REVIEW + REVEAL bracketing a clean finish. The full per-stage context
     # profiles (parse/brainstorm/write-plans with their own retrieval tiers) are
     # an engine-side pass, deferred. Stage markers give the host its pause/steer
-    # boundaries (specs/neo_lite_context_lifecycle_logs_killgate.md §3-4).
+    # boundaries.
     transport.send(protocol.stage("recon", "( ⚆ _ ⚆ )"))
     pool_used = 0
     steers: list[str] = []

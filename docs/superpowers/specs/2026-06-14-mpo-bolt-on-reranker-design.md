@@ -1,276 +1,120 @@
-# MPO Bolt-On Re-Ranker for the Persistent Session — Design
+# MPO Vector Codec for the Persistent Pool — Design
 
 **Date:** 2026-06-14
-**Status:** Approved-for-planning
+**Status:** Implemented
 **Repo:** Unlimited-Context-LLM (`aether-context`)
-**Author:** Aether research
 
 ## 1. Summary
 
-Bolt a **Matrix Product Operator (MPO) learned re-ranker** onto the retrieval path of
-Unlimited Context. Retrieval today is a single-stage cosine ANN scan over 256-dim static
-embeddings (`ContextPool.search`). This design adds an **opt-in second stage**: cheap
-cosine recall (top-M) → MPO learned re-rank → top-k, guarded by a CUSUM staleness detector
-that falls back to pure cosine whenever the operator drifts from ground truth.
+Add a **tensor-train (Matrix Product Operator) vector codec** to Unlimited Context's
+disk/memory encoding. The engine's whole premise is *encode & recover* — overflow is encoded
+to a local pool and the right slice is recovered on demand. This adds the numeric half of that
+contract: each slice's retrieval vector is **compressed into a tensor-train factorization on
+the way to disk and reconstructed on recovery**, so a long-running session's persistent pool
+holds more reach per byte.
 
-The MPO **cores persist to disk** alongside the pool, so the learned operator survives a
-close + reopen. That is the "persistent session": re-rank quality compounds across
-sessions instead of cold-starting every run.
-
-The MPO math is a **faithful, dependency-free port** of the AETHER-ATLAS MPO
-(`aether_atlas/mpo/`). Same physical dims, same bond chain, same contraction, same
-contrastive loss, same CUSUM. This is deliberate: the two systems must share **one operator
-definition** so they are correlated by construction and can later be bridged (one cores
-format, one math) rather than diverging into two independent atlases.
+It is **opt-in** (`vector_codec="mpo"`, default `"none"` = byte-identical to today),
+**numpy-only** (no new dependency), and **encode/recover only** — it does not rank, score,
+gate, judge, or otherwise touch relevance, retention, or correctness. Those remain the
+retrieval/witness layers' jobs. The codec's sole purpose is making the disk/memory encoding
+smaller, with a measured, bounded reconstruction error.
 
 ## 2. Goals / Non-Goals
 
 ### Goals
-- A learned, **read-path-only** re-ranker that improves which slices are surfaced for a turn.
-- **Opt-in**: `rerank="mpo"`. Off by default → byte-identical behavior to today.
-- **Fail-soft**: any error in embed/contract/train degrades to cosine order; never raises
-  into a long run (engine design law 3).
-- **Persistent**: cores + CUSUM state saved to `<pool_dir>/mpo.json`, restored on open.
-- **Numpy-only**: no new runtime dependency (matches the `aether-context` core contract).
-- **Atlas-correlated**: identical PHYSICAL_DIMS / BOND_CHAIN / contraction / loss / CUSUM
-  to `aether_atlas.mpo`, so a future bridge shares the operator and cores format.
+- Compress the **on-disk vector store** (the reach-bounding resource) with a tensor-train codec.
+- Opt-in; default off → identical behavior and on-disk layout to today.
+- Numpy-only, deterministic, fail-soft (the engine always works on raw vectors; the codec is a
+  footprint optimization, never a correctness dependency).
+- Honest: report compression ratio and measured reconstruction fidelity; never a silent claim.
 
 ### Non-Goals
-- No change to the **write path** (encode-on-spill, pool `add`, eviction). The MPO is a
-  read-path accelerator, exactly as in atlas.
-- **No dependency on or modification of** the AETHER-ATLAS repo. We clone the relevant math,
-  we do not import it.
-- No replacement of the `Witness` (retention/eviction stays cosine+salience based).
-- No GPU / torch. No training during generation (training is an explicit, off-hot-path call).
-- No quantum, no Protocol-C signing, no `AtlasCell` schema.
+- No relevance ranking, scoring, gating, training, ground-truth, hallucination handling, cost
+  accounting, or correctness grounding. **Encode and recover only.**
+- No change to the search semantics, the witness, or the slice schema.
+- No GPU / torch. No during-run hot/cold tiering (future work, explicitly not claimed).
 
-## 3. Background: the two systems
+## 3. Background: the reach model
 
-### 3.1 Atlas MPO (what we are cloning)
-`aether_atlas/mpo/tensor_core.py` — `MpoCore`:
-- `PHYSICAL_DIMS = {"model":16, "skill":32, "prompt":16, "time":4}` (sum 68).
-- `BOND_CHAIN = (2, 8, 8, 2, 1)`.
-- `_embed_feature_code(cell)` — cyclic read of `feature_code` into the 4 axes (handles any
-  code length; identical embedding for identical codes; similarity-preserving).
-- `forward(cells)` — per-cell transfer matrices `A_k = Σ_i v_i · core_k[:,i,:]`, chained and
-  read at `[0,0]` → one scalar per cell. `score = scalar × confidence`. `s_pos/s_neg` are
-  confidence-weighted polarity sums; `delta_norm = ||s_pos − s_neg||²`.
-- `train(cells, lr, n_iter)` — analytic gradients of `L = Σ_{P+}||x_c − x̃_c||² − α||s+ − s−||²`,
-  with global grad-norm clipping (`MAX_GRAD_NORM`).
-- `to_dict` / `from_dict` — cores round-trip.
-
-`aether_atlas/mpo/polarity_sieve.py` — `PolaritySieve` + `CusumDeltaTracker`:
-- `sweep(cells) -> SieveResult` (s_pos, s_neg, cell_ids, delta_norm, fidelity, scores).
-- `sweep_with_guard(cells) -> (result, is_stale)` — CUSUM over `delta_norm`; stale ⇒ caller
-  falls back to classical ANN.
-- `train_and_recover(cells)` — retrain bonds, reset CUSUM, clear stale flag.
-
-`_polarity(cell)`: +1 iff `edge>0 and source=="real" and lifecycle==VERIFIED`; −1 iff
-`edge<0 or lifecycle in {REFUTED,STALE,EVICTED}`; else 0.
-
-### 3.2 Unlimited Context retrieval (what we are bolting onto)
-- `StaticEncoder.encode(text) -> (256,) unit vector` (numpy-only, deterministic).
-- `ContextPool.search(query_vec, k, session) -> list[Slice]` — cosine top-k (flat/HNSW),
-  session-namespaced. `Slice = {id, session, vector(256), text, tokens, meta, score}`.
-- `Pager` — warm cache; cold path injected as `retrieve_fn` (defaults to a session-scoped
-  pool search). `Session._cold_retrieve` is the single funnel for the cold path.
-- `Witness` — per-slice retention score (`SALIENT_THRESHOLD=0.60`), decay, eviction order.
-- `Session` — ties them together; `remember()` plants high-salience facts; `recall()` reads.
+`cli.py` documents that the **float32 vector store lives on disk**; RAM holds only the
+~29 MB/GB index. Per slice the pool charges `dim*4 + 1200` bytes (`context_pool.py`): a 1024 B
+vector plus a 1200 B payload (text + meta + bookkeeping). Reach is `pool_gb × 233M tokens`,
+derived straight from that byte cost (`config.py`). So the on-disk vector block is a direct,
+compressible contributor to how much reach fits per GB — the lever this codec pulls.
 
 ## 4. Architecture
 
 ```
-                       ┌─────────────────────────────────────────────┐
-   query text ──encode─┤ Session._cold_retrieve(key, qvec, k)         │
-                       │                                              │
-                       │   M = k * OVERSCAN  (default 4)              │
-                       │   cand = pool.search(qvec, M, scope)  ←cosine recall (cheap)
-                       │                                              │
-                       │   if reranker enabled:                       │
-                       │     ranked, stale = reranker.rerank(qvec, cand)
-                       │     return (cosine top-k if stale            │
-                       │             else ranked top-k)               │
-                       │   else: return cand[:k]      (today's path)  │
-                       └─────────────────────────────────────────────┘
-        on close: reranker.save(<pool_dir>/mpo.json)   ← persistent operator
-        on open : reranker = MpoReranker.load_or_new(<pool_dir>/mpo.json)
+  add(slice)  ──►  working mmap (vectors.f32, exact float32)  ──►  cosine search (unchanged)
+                                   │ close()
+                                   ▼
+        encode each vector → tensor-train cores → vectors.mpo.json   (durable, smaller)
+                                   │  then drop vectors.f32 (at-rest = compressed only)
+                                   ▼
+  open()  ──►  reconstruct cores → working mmap  ──►  cosine search over reconstructed vectors
 ```
 
-### 4.1 New module: `aether_context/mpo.py`
-A **dependency-free clone** of the atlas MPO math. No import of `aether_atlas`. Generic over
-a tiny structural protocol instead of `AtlasCell`:
+During a live run the working store is the exact float32 mmap, so cosine search is unaffected.
+The codec acts at the **persistence boundary**: on `close()` the durable form becomes the
+compressed `vectors.mpo.json` and the raw `vectors.f32` is dropped; on `open()` the working
+mmap is reconstructed from the compressed store. Net: the **persistent pool's at-rest footprint
+shrinks** (~1.4× overall; the vector block ~2.7× at rank 4), so a larger persistent reach fits
+on disk and reloads. Reconstruction is lossy-but-bounded; fidelity rises with the bond rank.
 
-```python
-class MpoCandidate(Protocol):
-    feature_code: tuple[float, ...] | np.ndarray   # the vector the kernel sees
-    polarity: int                                   # +1 / -1 / 0
-    confidence: float                               # [0,1] weight
-    id: str                                          # stable identifier
-```
+### 4.1 `aether_context/mpo.py` — `MpoCodec`
+Standard **TT-SVD** (Oseledets, 2011). Pure, deterministic numpy.
+- `MpoCodec(dim=256, mode_shape=(4,4,4,4), rank=4)` — `mode_shape` must multiply to `dim`.
+- `encode(vector) -> TTVector` — reshape to the grid, sequential SVD with bond truncation to
+  `rank`; returns the cores.
+- `recover(TTVector) -> vector` — contract the cores back to a `(dim,)` float32 vector.
+- `compression_ratio(tt=None)` — stored-floats ratio; with no arg, the worst-case (all bonds
+  saturated) floor.
+- `fidelity(vector, tt=None)` — cosine between a vector and its round-trip reconstruction.
+- `to_dict`/`from_dict` (config) and `tt_to_lists`/`tt_from_lists` (per-vector JSON).
 
-Contents (ported verbatim in math, renamed for our domain where helpful):
-- Constants: `PHYSICAL_DIMS`, `BOND_CHAIN`, `ALPHA_DEFAULT`, `MAX_GRAD_NORM` — **identical
-  values to atlas**.
-- `_embed_feature_code`, `_embed_batch`, `_init_cores`, `_axis_mats`, `_contract` — verbatim.
-- `MpoCore` with `forward`, `train`, `_loss_and_grads`, `to_dict`, `from_dict` — verbatim,
-  except it reads `candidate.polarity` / `candidate.confidence` / `candidate.feature_code`
-  directly (atlas's `_polarity(cell)` is replaced by the candidate's precomputed `polarity`,
-  because our polarity comes from session signals, not edge/lifecycle).
-- `CusumDeltaTracker` — verbatim.
-- `MpoForwardResult`, `SieveResult` — verbatim shapes.
+### 4.2 `aether_context/context_pool.py` — opt-in persistence
+- `MpoCodec` built from `PoolConfig.vector_codec`/`codec_rank`.
+- `close()` → `_persist_compressed()`: encode every live slice's stored unit vector, write
+  `vectors.mpo.json` (`{version, codec, rows:[{row, tt}]}`), drop `vectors.f32`.
+- `_load()`: if `vectors.f32` is absent but the compressed store is present, reconstruct the
+  working mmap (re-normalizing each row to unit, since stored vectors are unit). If the
+  compressed store is present but the pool was opened with `vector_codec="none"`, raise
+  `PoolCorrupt` with a clear hint.
+- `stats()` gains `vector_codec` + `vector_codec_ratio`.
 
-> **Correlation invariant (documented in the module docstring):** the dims, bond chain,
-> contraction einsums, loss formula, and CUSUM constants MUST equal
-> `aether_atlas.mpo.tensor_core`. If atlas changes the operator, this file is updated to
-> match. A drift test (§7) pins the constants.
+### 4.3 `aether_context/config.py` / `session.py`
+- `PoolConfig.vector_codec` (`"none"|"mpo"`) + `codec_rank` (≥1), validated.
+- `Session(vector_codec=..., codec_rank=...)` passes through to the pool; `status_dict()`
+  surfaces `vector_codec` + `vector_codec_ratio`.
 
-### 4.2 New module: `aether_context/mpo_rerank.py`
-The bolt-on adapter + façade. This is the only place that knows about `Slice`.
-
-```python
-@dataclass(frozen=True)
-class _SliceCandidate:           # implements MpoCandidate
-    feature_code: np.ndarray     # = slice.vector (256-dim; cyclic read handles len != 68)
-    polarity: int
-    confidence: float
-    id: str
-
-class MpoReranker:
-    def __init__(self, core: MpoCore | None = None, *,
-                 cusum_threshold: float = 3.0, overscan: int = 4): ...
-
-    # adapter: Slice + retention signal -> candidate
-    @staticmethod
-    def _to_candidate(sl: Slice, *, score: float, hit: bool) -> _SliceCandidate: ...
-
-    # the read-path move: re-rank cosine candidates, guarded
-    def rerank(self, query_vec, slices: list[Slice], k: int,
-               score_of: Callable[[str], float]) -> list[Slice]: ...
-
-    # off-hot-path learning from a session's judged slices
-    def train(self, slices, score_of, lr=0.01, n_iter=20) -> float: ...
-
-    # persistence (the "persistent session")
-    def save(self, path) -> None: ...
-    @classmethod
-    def load_or_new(cls, path, **kw) -> "MpoReranker": ...
-```
-
-**Polarity mapping** (`Slice` → P), via the witness score `s = score_of(slice.id)` and meta:
-- `meta.get("kind") == "fact"` **or** `s >= SALIENT_THRESHOLD (0.60)` → **+1**
-- `meta.get("stale")` truthy, or `meta.get("kind") == "evicted"`, or `s < _NEG_FLOOR (0.15)`
-  → **−1**
-- else → **0** (skipped by the sweep, exactly like atlas synthetic priors)
-
-`confidence` = `clamp(s, 0, 1)` (the retention score doubles as the MPO weight).
-`feature_code` = `slice.vector` (the 256-dim retrieval embedding). The cyclic read in
-`_embed_feature_code` maps 256 dims onto the 68-dim physical layout deterministically and
-similarity-preservingly, so the operator is identical to atlas's even though our codes are
-longer than trading's (8) or qopc's (64).
-
-**`rerank` semantics (fail-soft, guarded):**
-1. If reranker disabled or `< 2` candidates → return `slices[:k]` unchanged.
-2. Build candidates; run `core.forward` + CUSUM `observe(delta_norm)`.
-3. If CUSUM fires (**stale**) → log `STALE_SERVED`, return cosine order `slices[:k]`.
-4. Else sort by `|score|` desc (ties → original cosine order, stable), return top-k.
-5. Any exception → log + return `slices[:k]`. The re-rank is never a correctness dependency.
-
-### 4.3 Wiring into `Session`
-- New `__init__` param `rerank: str = "off"` (`"off" | "mpo"`). Validated like `pool_mode`.
-- New param `rerank_overscan: int = 4` (M = k × overscan, floored at k).
-- When `rerank == "mpo"`:
-  - `self.reranker = MpoReranker.load_or_new(<pool_dir>/mpo.json, overscan=rerank_overscan)`.
-  - `_cold_retrieve` pulls `M` cosine candidates, then
-    `self.reranker.rerank(qvec, cand, k, score_of=self.witness.score)`.
-  - `close()` calls `self.reranker.train(judged_slices, ...)` then `self.reranker.save(...)`
-    (both fail-soft). Training set = the session's pool slices (those with P≠0).
-- When `rerank == "off"`: `self.reranker is None`; `_cold_retrieve` is **exactly today's**
-  `pool.search(qvec, k, scope)` — zero behavior change, zero new disk artifact.
-- `status_dict()` gains `"rerank"` (the mode) and, when on, `"rerank_stale"` (bool) and
-  `"mpo_updates"` (core `n_updates`) — all honest, never a silent capability claim.
-
-### 4.4 Persistence format `<pool_dir>/mpo.json`
+### 4.4 Persistence format `vectors.mpo.json`
 ```json
 {
   "version": 1,
-  "encoder_version": "static_v1",
-  "core": { "...MpoCore.to_dict()...": "alpha, n_updates, cores, bond_chain, physical_dims" },
-  "cusum": {"mu": 0.0, "cusum_high": 0.0, "cusum_low": 0.0, "threshold": 3.0, "drift": 0.5, "n": 0}
+  "codec": {"dim": 256, "mode_shape": [4, 4, 4, 4], "rank": 4},
+  "rows": [{"row": 0, "tt": {"mode_shape": [4, 4, 4, 4], "cores": [[[...]]]}}]
 }
 ```
-- `encoder_version` mismatch on load → start a **fresh** core (stale cores trained on a
-  different embedding scheme are not reused; logged, not raised).
-- Missing/corrupt file → fresh core (fail-soft; never blocks a session).
-- The file lives next to `pool.json` / `vectors.f32`; in `shared` mode one operator serves the
-  shared pool, in `separate` mode it is still one file per pool dir (the operator is
-  domain-agnostic — it ranks by learned relevance, the session scope is enforced upstream by
-  the cosine recall stage).
 
-## 5. Data flow (one turn, rerank=mpo)
-
-1. Model reasons; `Session._page_working_set` / prefetch calls the pager.
-2. Pager cold path → `Session._cold_retrieve(key, qvec, k)`.
-3. `pool.search(qvec, M=k×4, scope)` → M cosine candidates (recall).
-4. `reranker.rerank(qvec, candidates, k, witness.score)`:
-   - candidates ← Slice→candidate (polarity from witness score + meta).
-   - `core.forward` → per-candidate scores + `delta_norm`; CUSUM observes.
-   - stale ⇒ cosine top-k; else MPO-sorted top-k.
-5. Pager warms the returned k; model is handed the resident window.
-6. On `close()`: train cores on judged slices, save `mpo.json`.
-
-## 6. Error handling / fail-soft
+## 5. Error handling / fail-soft
 
 | Failure | Behavior |
 |---|---|
-| Encoder error building query | pager already handles (returns `[]`); rerank not reached |
-| `core.forward` raises | log, return cosine `slices[:k]` |
-| CUSUM fires (stale operator) | log `STALE_SERVED`, return cosine `slices[:k]` |
-| `train` raises on close | log, skip training, still attempt save of current cores |
-| `save` raises | log, close continues (operator just isn't persisted this run) |
-| `mpo.json` corrupt / version mismatch | log, fresh core |
-| `rerank="off"` | reranker is `None`; original cosine path verbatim |
+| compressed write fails on close | log, keep raw `vectors.f32` (valid, larger pool) |
+| compressed store malformed on load | `PoolCorrupt` with the file named |
+| compressed present, codec off | `PoolCorrupt` with hint to reopen `vector_codec="mpo"` |
+| `vector_codec="none"` (default) | raw float32 path, no compressed artifact — unchanged |
 
-Mirrors the engine's existing fail-soft discipline (`Session`, `Pager` already log-and-degrade).
+## 6. Testing
+- `tests/test_mpo.py` — construction validation, encode/recover round-trip, full-rank near-lossless,
+  low-rank lossy-but-bounded fidelity, determinism, compression ratio, serialization.
+- `tests/test_context_pool.py::TestMpoVectorCodec` — off-by-default keeps raw + no sidecar;
+  close writes compressed + drops raw; reopen reconstructs searchably; reopen without codec
+  raises; stats report the codec.
+- `tests/test_session.py::TestMpoVectorCodec` — off by default; status surfacing; persistent
+  pool recovers a planted fact after reopen; invalid codec raises.
 
-## 7. Testing
-
-Port the atlas MPO suite, then add bolt-on + integration tests. Pytest, AAA, ≥80% on new code.
-
-**`tests/test_mpo.py`** (ported math, adapted to candidates):
-- polarity passthrough; forward empty / pos-only / mixed / skips-P0; train reduces loss;
-  train no-positive no-crash; serialization round-trip; **drift test**: assert
-  `PHYSICAL_DIMS`, `BOND_CHAIN`, `ALPHA_DEFAULT` equal the atlas values (string-literal pin,
-  no atlas import) so a silent divergence fails CI.
-
-**`tests/test_mpo_rerank.py`**:
-- `_to_candidate` polarity mapping (fact→+1, salient→+1, faded→−1, neutral→0).
-- rerank changes order vs cosine when cores favor a different slice (train then assert).
-- **stale → fallback**: force CUSUM fire → returns exact cosine order.
-- **fewer than 2 candidates / empty** → returned unchanged.
-- **fail-soft**: monkeypatch `core.forward` to raise → cosine order, no exception.
-- persistence: save → load_or_new restores cores (`n_updates`, shapes); corrupt file → fresh;
-  encoder_version mismatch → fresh.
-- off-by-default: `MpoReranker` not constructed when mode off (covered in session test).
-
-**`tests/test_session.py`** (extend):
-- `Session(rerank="mpo")` runs end-to-end on the mock; produces `mpo.json` on close.
-- `Session(rerank="off")` (default) → **no `mpo.json`**, `_cold_retrieve` returns the same
-  slices as a direct `pool.search` (parity assertion).
-- reopen with `rerank="mpo"` loads the persisted operator (`status_dict()["mpo_updates"] > 0`).
-- invalid `rerank=` value raises a typed `AetherContextError`/`PoolBudgetError`.
-
-## 8. Rollout / reversibility
-
-- Pure addition: two new modules + additive `Session`/`status` params. No edits to encoder,
-  pool write path, witness, or default behavior.
-- Default `rerank="off"` ⇒ the feature is dormant until explicitly enabled. Removing the
-  feature = delete two files + the wiring; no migration, no data format change to the pool.
-- `mpo.json` is independent of `pool.json`; deleting it just cold-starts the operator.
-
-## 9. Open correlation note (for a future bridge, not this PR)
-
-Because the operator math is identical to `aether_atlas.mpo`, a later bridge can:
-- share the `core` cores JSON between an atlas instance and a session (same shapes/format), and
-- treat session-trained cores as a warm start for an atlas pool (and vice versa),
-so the session and the main atlas **collaborate on one operator** rather than drifting into
-two. This PR only establishes the shared math + format; the bridge itself is out of scope.
+## 7. Reversibility
+Pure addition: one new module + additive config/pool/session params. Default `"none"` keeps the
+on-disk format and behavior identical. Removing the feature = delete `mpo.py` + the wiring; no
+migration for `"none"` pools.

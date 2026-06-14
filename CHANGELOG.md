@@ -7,13 +7,13 @@ All notable changes to `aether-context` are documented here. Format follows
 ## [Unreleased]
 
 ### Added
-- **MPO re-ranker (opt-in).** `Session(rerank="mpo")` adds a learned tensor-train re-rank
-  stage after cosine recall (cosine top-M → MPO re-rank → top-k), with a CUSUM staleness
-  fallback to pure cosine. The operator persists to `<pool_dir>/mpo.json` so re-rank quality
-  survives a close + reopen (the "persistent session"). The math is a faithful,
-  dependency-free port of the AETHER-ATLAS MPO (numpy-only, read-path only). Default
-  `rerank="off"` is byte-identical to prior behavior. `Session.remember()` now tags planted
-  facts `kind="fact"` so they anchor the operator's positive training signal.
+- **MPO vector codec (opt-in).** `Session(vector_codec="mpo")` / `PoolConfig(vector_codec="mpo")`
+  compresses the pool's on-disk vector store with a tensor-train (Matrix Product Operator)
+  factorization — encode to compact cores on `close()`, reconstruct the working store on
+  `open()` — so a persistent pool holds more reach per byte. Numpy-only, deterministic,
+  lossy-but-bounded (fidelity rises with `codec_rank`); `status`/`stats` report the codec and
+  its compression ratio. Encode & recover only — it never ranks, scores, or gates slices.
+  Default `vector_codec="none"` is byte-identical to prior behavior.
 - `Witness` **temporal lock-in (anti-thrash)** — a freshly touched (just paged-in) slice carries
   a short-lived eviction bonus (`pin_periods` / `pin_bonus`) so the byte governor cannot evict it
   straight back to disk on the next turn, breaking the evict→cold-miss→re-page window flap. The

@@ -46,6 +46,9 @@ CONFIG_FILENAME = "config.json"
 
 _VALID_INDEX = ("flat", "hnsw", "tiered")
 _VALID_MODE = ("separate", "shared")
+_VALID_VECTOR_CODEC = ("none", "mpo")
+#: Default max bond rank for the MPO vector codec (see aether_context.mpo).
+DEFAULT_CODEC_RANK = 4
 
 
 def reach_tokens(pool_gb: int) -> int:
@@ -91,6 +94,11 @@ class PoolConfig:
     dim: int = DEFAULT_DIM
     slice_tokens: int = DEFAULT_SLICE_TOKENS
     dir: Path = field(default_factory=default_pool_dir)
+    #: Vector codec for the on-disk store. "none" (default) keeps raw float32; "mpo" compresses
+    #: each vector into a tensor-train at rest and reconstructs it on load (lossy, bounded).
+    vector_codec: str = "none"
+    #: Max bond rank for the MPO codec (higher = better fidelity, less compression).
+    codec_rank: int = DEFAULT_CODEC_RANK
 
     def __post_init__(self) -> None:
         # Path coercion (callers may pass a str).
@@ -110,6 +118,16 @@ class PoolConfig:
             raise PoolBudgetError(
                 f"mode={self.mode!r} is not one of {_VALID_MODE}",
                 hint="Use mode='separate' (default) or 'shared'.",
+            )
+        if self.vector_codec not in _VALID_VECTOR_CODEC:
+            raise PoolBudgetError(
+                f"vector_codec={self.vector_codec!r} is not one of {_VALID_VECTOR_CODEC}",
+                hint="Use vector_codec='none' (default, raw float32) or 'mpo' (tensor-train).",
+            )
+        if int(self.codec_rank) < 1:
+            raise PoolBudgetError(
+                f"codec_rank={self.codec_rank} must be >= 1",
+                hint="Higher rank = better reconstruction fidelity, less compression.",
             )
 
     @property

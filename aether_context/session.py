@@ -56,7 +56,6 @@ from aether_context.errors import (
     OllamaNotRunning,
 )
 from aether_context.local_llm import LocalLLM, load_model
-from aether_context.mpo_rerank import MpoReranker
 from aether_context.slice_loader import Pager, SliceKey
 from aether_context.tokenizer import from_backend
 from aether_context.witness import Witness, retention_score, uniqueness_from_neighbors
@@ -78,10 +77,6 @@ _RESIDENT_RAM_MB_PER_GB: int = 29
 _DEFAULT_TRANSCRIPT_NAME: str = "aether-transcript.txt"
 #: How much the Extended-Thinking toggle widens the resident working set (mock-honest).
 _EXTENDED_RESIDENT_BONUS: int = 8
-#: Valid re-rank modes for Session(rerank=...). "off" = today's pure-cosine path.
-_VALID_RERANK = ("off", "mpo")
-#: Sidecar filename for the persisted MPO operator, written inside the pool dir.
-_MPO_SIDECAR_NAME = "mpo.json"
 
 
 # ---------------------------------------------------------------------------
@@ -158,8 +153,8 @@ class Session:
         resident_k: int = DEFAULT_RESIDENT_K,
         pool_ceiling_bytes: int | None = None,
         session_id: str | None = None,
-        rerank: str = "off",
-        rerank_overscan: int = 4,
+        vector_codec: str = "none",
+        codec_rank: int = 4,
         **cfg: Any,
     ) -> None:
         self.id: str = session_id or f"sess-{uuid.uuid4().hex[:12]}"
@@ -170,13 +165,6 @@ class Session:
         # slices. "shared" makes reach global (search/encode with session=None) so a named or
         # persistent pool can be read across sessions. The PoolConfig records the same mode.
         self.pool_mode: str = pool_mode
-        if rerank not in _VALID_RERANK:
-            raise AetherContextError(
-                f"rerank={rerank!r} is not one of {_VALID_RERANK}.",
-                hint="Use rerank='off' (default, pure cosine) or rerank='mpo'.",
-            )
-        self.rerank_mode: str = rerank
-        self._rerank_overscan: int = max(1, int(rerank_overscan))
         # Extended-Thinking toggle (honest): in the mock it only widens the resident set and
         # surfaces in status; it is never a silent capability claim.
         self.extended: bool = False
@@ -204,6 +192,8 @@ class Session:
             mode=pool_mode,
             index=pool_index,
             dir=Path(pool_dir) if pool_dir is not None else PoolConfig().dir,
+            vector_codec=vector_codec,
+            codec_rank=codec_rank,
         )
         self.pool: ContextPool = ContextPool(
             pool_config, ceiling_bytes=pool_ceiling_bytes
@@ -225,15 +215,6 @@ class Session:
             default_k=self._resident_k,
             retrieve_fn=self._cold_retrieve,
         )
-
-        # -- optional MPO re-rank bolt-on (read-path only; off by default) -----
-        self.reranker: MpoReranker | None = None
-        self._mpo_sidecar: Path | None = None
-        if self.rerank_mode == "mpo":
-            self._mpo_sidecar = Path(pool_config.dir) / _MPO_SIDECAR_NAME
-            self.reranker = MpoReranker.load_or_new(
-                self._mpo_sidecar, overscan=self._rerank_overscan
-            )
 
         # -- run state --------------------------------------------------------
         self._harvest: list[HarvestCandidate] = []
@@ -322,17 +303,8 @@ class Session:
         return None if self.pool_mode == "shared" else self.id
 
     def _cold_retrieve(self, key: SliceKey, query_vec: np.ndarray, k: int) -> list[Slice]:
-        """Pager cold path. With rerank='mpo', cosine-recall top-M then MPO re-rank to top-k.
-
-        With rerank='off' (default) this is exactly a session-scoped ``pool.search`` — no
-        behavior change. The re-rank stage is fail-soft (the reranker itself degrades to the
-        cosine order on any error or a CUSUM stale verdict).
-        """
-        if self.reranker is None:
-            return self.pool.search(query_vec, k, session=self._scope())
-        width = self.reranker.recall_width(k)
-        candidates = self.pool.search(query_vec, width, session=self._scope())
-        return self.reranker.rerank(query_vec, candidates, k, score_of=self.witness.score)
+        """Pager cold path honoring the session's pool mode (shared -> global search)."""
+        return self.pool.search(query_vec, k, session=self._scope())
 
     # -- plant / recover a fact -----------------------------------------------
     def remember(self, text: str, *, tags: dict[str, Any] | None = None) -> Slice | None:
@@ -341,13 +313,8 @@ class Session:
         This is how a durable constraint is established before a long run so it survives the
         overflow: it is encoded into the pool immediately and hardened in the witness. Returns
         the stored :class:`Slice` (or ``None`` if encoding fails — fail-soft).
-
-        The slice is tagged ``kind="fact"`` (unless the caller overrides ``kind``): a planted
-        fact is the load-bearing positive signal the optional MPO re-ranker trains on, so it
-        is marked as such regardless of its computed retention score.
         """
-        meta = {"kind": "fact", **(tags or {})}
-        return self._encode_slice(text, salience=_REMEMBER_SALIENCE, tags=meta)
+        return self._encode_slice(text, salience=_REMEMBER_SALIENCE, tags=tags or {})
 
     def recall(self, query: str, k: int = DEFAULT_RESIDENT_K) -> list[Slice]:
         """Retrieve the slices nearest to ``query`` from this session's pool region.
@@ -707,11 +674,10 @@ class Session:
             "resident_ram_mb": self.pool_gb * _RESIDENT_RAM_MB_PER_GB,
             "pool_mode": self.pool_mode,
             "index": stats["index"],
+            "vector_codec": stats.get("vector_codec", "none"),
+            "vector_codec_ratio": stats.get("vector_codec_ratio", 1.0),
             "model": getattr(self.local_llm, "name", str(self.config.model)),
             "extended": self.extended,
-            "rerank": self.rerank_mode,
-            "rerank_stale": (self.reranker.is_stale if self.reranker else False),
-            "mpo_updates": (self.reranker.core._n_updates if self.reranker else 0),
         }
 
     # -- close + context manager ----------------------------------------------
@@ -724,34 +690,7 @@ class Session:
         if self._closed:
             return
         self._closed = True
-        self._persist_reranker()
         self._flush_pool()
-
-    def _persist_reranker(self) -> None:
-        """Train the MPO operator on this session's judged slices and save it (fail-soft).
-
-        No-op when rerank='off'. Training set is every slice this session externalized into
-        the pool (polarity is derived inside the re-ranker from the witness score + meta).
-        Both train and save are best-effort — a re-rank failure must never block a clean close.
-        """
-        if self.reranker is None or self._mpo_sidecar is None:
-            return
-        try:
-            slices = self._live_session_slices()
-            if slices:
-                self.reranker.train(slices, score_of=self.witness.score)
-            self.reranker.save(self._mpo_sidecar)
-        except Exception as exc:  # noqa: BLE001 - fail-soft: close must never raise
-            logger.warning("MPO persist failed (%s); operator not saved this run", exc)
-
-    def _live_session_slices(self) -> list[Slice]:
-        """The live pool slices this session externalized (the operator's training set)."""
-        out: list[Slice] = []
-        for sid in list(self.pool._slices.keys()):  # pool is the source of truth (read-only)
-            sl = self.pool._slices.get(sid)
-            if sl is not None and sl.session == self.id:
-                out.append(sl)
-        return out
 
     def _flush_pool(self) -> None:
         """Flush + release the pool's mmap (fail-soft; close must never raise)."""

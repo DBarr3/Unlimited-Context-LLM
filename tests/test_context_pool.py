@@ -410,3 +410,52 @@ def test_tiered_index_warns_and_runs_flat(tmp_pool_dir):
     assert pool.index_kind == "flat"
     pool.add(make_slice("a", vector=_basis(0)))
     assert pool.search(_basis(0), k=1)[0].id == "a"
+
+
+# --- MPO vector codec (opt-in at-rest compression) ---------------------------
+class TestMpoVectorCodec:
+    """vector_codec='mpo' compresses the on-disk vector store; reopen reconstructs it."""
+
+    def test_off_by_default_no_compressed_sidecar(self, tmp_path):
+        from aether_context.context_pool import COMPRESSED_VECTORS_FILENAME, VECTORS_FILENAME
+        pool = ContextPool(small_config(tmp_path))
+        pool.add(make_slice("a", vector=_basis(1)))
+        pool.close()
+        assert (tmp_path / VECTORS_FILENAME).exists()        # raw store kept
+        assert not (tmp_path / COMPRESSED_VECTORS_FILENAME).exists()
+
+    def test_close_writes_compressed_and_drops_raw(self, tmp_path):
+        from aether_context.context_pool import COMPRESSED_VECTORS_FILENAME, VECTORS_FILENAME
+        pool = ContextPool(small_config(tmp_path, vector_codec="mpo"))
+        pool.add(make_slice("a", vector=_basis(1)))
+        pool.add(make_slice("b", vector=_basis(2)))
+        pool.close()
+        assert (tmp_path / COMPRESSED_VECTORS_FILENAME).exists()
+        assert not (tmp_path / VECTORS_FILENAME).exists()    # raw dropped at rest
+
+    def test_reopen_reconstructs_searchably(self, tmp_path):
+        pool = ContextPool(small_config(tmp_path, vector_codec="mpo"))
+        pool.add(make_slice("a", session="s", vector=_basis(1)))
+        pool.add(make_slice("b", session="s", vector=_basis(2)))
+        pool.close()
+        # Reopen with the same codec; the working mmap is rebuilt from the compressed store.
+        pool2 = ContextPool(small_config(tmp_path, vector_codec="mpo"))
+        assert len(pool2) == 2
+        hits = pool2.search(_unit(_basis(1)), k=1, session="s")
+        assert hits and hits[0].id == "a"   # nearest neighbour survives the round-trip
+        pool2.close()
+
+    def test_reopen_without_codec_raises(self, tmp_path):
+        pool = ContextPool(small_config(tmp_path, vector_codec="mpo"))
+        pool.add(make_slice("a", vector=_basis(1)))
+        pool.add(make_slice("b", vector=_basis(2)))
+        pool.close()
+        with pytest.raises(PoolCorrupt):
+            ContextPool(small_config(tmp_path))  # raw gone, codec off -> cannot load
+
+    def test_stats_report_codec(self, tmp_path):
+        pool = ContextPool(small_config(tmp_path, vector_codec="mpo"))
+        st = pool.stats()
+        assert st["vector_codec"] == "mpo"
+        assert st["vector_codec_ratio"] > 1.0
+        pool.close()
