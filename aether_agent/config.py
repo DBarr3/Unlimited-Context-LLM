@@ -22,9 +22,9 @@ import os
 from pathlib import Path
 from typing import Any
 
-#: The public API front door. The backend is exposed under /cloud (VPS1 proxy ->
-#: VPS2); the apex returns an info blob, so the /cloud suffix is required for
-#: every API call. Override with AETHER_BASE_URL.
+#: The public API front door. The backend is exposed under /cloud; the apex
+#: returns an info blob, so the /cloud suffix is required for every API call.
+#: Override with AETHER_BASE_URL.
 DEFAULT_BASE_URL = "https://api.aethersystems.net/cloud"
 
 #: Config defaults — keys mirror src/core/config.ts DEFAULT_CONFIG (plus

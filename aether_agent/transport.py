@@ -3,8 +3,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Transport — ApiClient, the ONLY network surface to the Aether API.
 
-Mirror of aether-code ``src/core/transport.ts``. Talks to the public front door
-(VPS1 proxy -> VPS2); the server enforces usage and signs every request. Route
+Mirror of aether-code ``src/core/transport.ts``. Talks to the public Aether API
+front door; all access control and usage enforcement happen server-side. Route
 constants live here so a path changes in exactly one place and stays in lockstep
 with the TS host.
 
