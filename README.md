@@ -8,7 +8,7 @@ Give your Ai superpowers with **Unlimited context for [Ollama](https://ollama.co
 
 [![License](https://img.shields.io/badge/license-Apache--2.0-06b6d4)](LICENSE) [![Python](https://img.shields.io/badge/python-3.10%2B-14b8a6)](https://www.python.org) [![Built by Aether](https://img.shields.io/badge/built%20by-Aether-7c3aed)](https://aethersystems.net)
 
-**An open project from [Aether](https://aethersystems.net)** · Apache-2.0 · `pip install aether-context`
+**An open project from [Aether](https://aethersystems.net)** · Apache-2.0 · [Install](#quickstart)
 
 </div>
 
@@ -36,6 +36,7 @@ Give your Ai superpowers with **Unlimited context for [Ollama](https://ollama.co
   <a href="#the-math-per-tier">The math</a> ·
   <a href="#ram-footprint">RAM</a> ·
   <a href="#common-commands">Commands</a> ·
+  <a href="#the-aether-coding-terminal">Terminal</a> ·
   <a href="#quickstart">Install</a> ·
   <a href="#citation">Cite</a>
 </p>
@@ -222,9 +223,38 @@ RAM  ≈  ~180 MB   base (engine + shared static encoder)
 
 > **Tip:** run `aether-context doctor` first — it catches the three things that ever go wrong (Ollama down, model not pulled, not enough disk) and prints the exact fix.
 
+## The `aether` coding terminal
+
+The same install ships a second command — **`aether`** — an open-source agentic **coding terminal**
+running on the Unlimited Context engine. It's **local-first**: turns run on your local **[Ollama](https://ollama.com)**
+by default (no account, no network); sign in and they switch to the **Aether cloud API**. It's the
+Python-native twin of [`aether-code`](https://github.com/DBarr3/aether-agent) (the TypeScript terminal)
+— same commands, same backend, same tools.
+
+| Command | What it does |
+|---|---|
+| `aether` | Open the interactive REPL (local Ollama by default). |
+| `aether "<prompt>"` | One-shot turn, streamed. |
+| `aether code "<task>"` | Autonomous coding run on the Unlimited Context brain (test-gated, git-checkpointed). |
+| `aether auth login` | Sign in (`--token <t>` or `--username/--password`) → turns switch to the Aether cloud API. |
+| `aether auth status \| logout \| token` | Show / clear / print the stored credential. |
+| `aether models` | List models available to your tier. |
+| `aether config [show\|get <k>\|set <k> <v>]` | Local settings, incl. `backend = auto\|local\|cloud`. |
+
+**Slash commands** (inside the REPL): `/help` · `/models` · `/model <tag>` · `/agents` · `/agent <id>` · `/tier` · `/audit [n]` · `/web <query>` · `/clear` · `/exit`.
+
+**Web tools** — the agent can reach the web on any backend: `web_search` (DuckDuckGo, no key) and `web_fetch` (URL → readable text, SSRF-guarded).
+
+**Backend** — `auto` (the default) uses your local Ollama until you `aether auth login`, then the Aether cloud API. Force it with `aether config set backend local|cloud` or `AETHER_BACKEND=local`.
+
 ## Quickstart
 
 ```bash
+# Install straight from GitHub — works today, always the latest:
+pip install git+https://github.com/DBarr3/Unlimited-Context-LLM.git
+
+# From PyPI, once published — the package name is "aether-context"
+# (note: `pip install unlimited-context` is NOT the package name):
 pip install aether-context
 ```
 
@@ -267,7 +297,7 @@ If Unlimited Context helps your work, please cite it. Built and maintained by **
   author       = {Barrante, Brandon},
   organization = {Aether AI},
   year         = {2026},
-  url          = {https://github.com/DBarr3/Unlimited-Context},
+  url          = {https://github.com/DBarr3/Unlimited-Context-LLM},
   license      = {Apache-2.0}
 }
 ```
