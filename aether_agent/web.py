@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import ipaddress
 import socket
+import urllib.error
 import urllib.parse
 import urllib.request
 from html.parser import HTMLParser
@@ -245,11 +246,34 @@ def _http_post(url: str, data: dict, *, timeout: int = TIMEOUT) -> str:
     return raw.decode("utf-8", errors="replace")
 
 
+class _GuardedRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Re-run the SSRF guard on EVERY redirect hop.
+
+    Without this, a public host that passes is_safe_url could 3xx-redirect the
+    request to http://169.254.169.254/ (cloud metadata) or an RFC-1918 service,
+    and urllib would silently follow it — defeating the very guard web_fetch
+    exists to enforce. We refuse such a redirect by raising, which urllib turns
+    into an HTTPError the caller surfaces as a clean '[web_fetch error: ...]'."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # type: ignore[override]
+        safe = is_safe_url(newurl)
+        if safe is not True:
+            raise urllib.error.HTTPError(newurl, code, f"refused redirect: {safe}", headers, fp)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+# A module-level opener that enforces the SSRF guard across redirects. Built once;
+# the handler is stateless. Tests can still inject _resolve_ips to steer the guard.
+_GUARDED_OPENER = urllib.request.build_opener(_GuardedRedirectHandler())
+
+
 def _http_get(url: str, *, timeout: int = TIMEOUT) -> str:
     """GET a URL (caller MUST have passed is_safe_url first) and return the body,
-    capped at MAX_BYTES."""
+    capped at MAX_BYTES. Every redirect hop is re-validated by the SSRF guard
+    (via _GuardedRedirectHandler) so a public host cannot bounce us to an
+    internal/metadata address."""
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Accept": "text/html"})
-    with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 — guarded by is_safe_url
+    with _GUARDED_OPENER.open(req, timeout=timeout) as resp:  # noqa: S310 — guarded + per-hop re-checked
         raw = resp.read(MAX_BYTES)
         charset = "utf-8"
         ctype = resp.headers.get("Content-Type", "")

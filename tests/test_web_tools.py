@@ -178,3 +178,57 @@ def test_web_fetch_happy_path_extracts_text(monkeypatch):
     finally:
         srv.shutdown()
         srv.server_close()
+
+
+def test_web_fetch_refuses_redirect_to_internal_host(monkeypatch):
+    # SSRF redirect bypass: an allowed (public) host MUST NOT be able to 3xx-bounce
+    # the fetch to an internal/loopback target. We stand up two loopback servers:
+    # a redirector that 302s to a 'secret' internal page, and the secret page. The
+    # guard is told (via _resolve_ips) the INITIAL host is public, so it allows the
+    # first hop; the redirect target is loopback and MUST be refused per-hop. The
+    # internal body must never reach the caller, and web_fetch must not raise.
+    import http.server
+    import threading
+
+    secret = b"<html><body><p>INTERNAL SECRET PAGE</p></body></html>"
+
+    class Secret(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.send_header("Content-Length", str(len(secret)))
+            self.end_headers()
+            self.wfile.write(secret)
+
+        def log_message(self, *a):
+            pass
+
+    ssrv = http.server.HTTPServer(("127.0.0.1", 0), Secret)
+    sport = ssrv.server_address[1]
+    threading.Thread(target=ssrv.serve_forever, daemon=True).start()
+
+    class Redir(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802
+            self.send_response(302)
+            self.send_header("Location", f"http://127.0.0.1:{sport}/secret")
+            self.end_headers()
+
+        def log_message(self, *a):
+            pass
+
+    rsrv = http.server.HTTPServer(("127.0.0.1", 0), Redir)
+    rport = rsrv.server_address[1]
+    threading.Thread(target=rsrv.serve_forever, daemon=True).start()
+
+    try:
+        # Initial host resolves (spoofed) to PUBLIC -> guard allows hop 1. The
+        # redirect target (127.0.0.1) is internal -> the redirect handler refuses.
+        monkeypatch.setattr(web, "_resolve_ips", lambda host: ["93.184.216.34"])
+        out = web.web_fetch(f"http://localhost:{rport}/start")
+        assert "INTERNAL SECRET PAGE" not in out, "redirect to internal host leaked"
+        assert out.startswith("[web_fetch error"), f"expected a clean error, got {out!r}"
+    finally:
+        ssrv.shutdown()
+        ssrv.server_close()
+        rsrv.shutdown()
+        rsrv.server_close()
