@@ -247,6 +247,8 @@ Python-native twin of [`aether-code`](https://github.com/DBarr3/aether-agent) (t
 
 **Backend** — `auto` (the default) uses your local Ollama until you `aether auth login`, then the Aether cloud API. Force it with `aether config set backend local|cloud` or `AETHER_BACKEND=local`.
 
+**Smoke test** — with Ollama up, `python -m aether_agent.smoke` (or `aether-smoke`) runs the SSRF guard, a real local turn, a web search + fetch, and the cloud path (when signed in), printing `PASS`/`SKIP`/`FAIL` (exit non-zero only on a real failure — missing Ollama/network/sign-in are skips).
+
 ## Quickstart
 
 ```bash
